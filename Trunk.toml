@@ -1,2 +1,5 @@
 [build]
-release = true # use `cargo build --release`
+release = true  # use `cargo build --release`
+
+[tools]
+wasm_opt = "version_123"
