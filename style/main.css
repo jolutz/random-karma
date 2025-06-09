@@ -1,0 +1,1106 @@
+:root {
+  /* Color system */
+  --color-primary: #4361ee;
+  --color-primary-light: #4895ef;
+  --color-primary-dark: #3f37c9;
+  --color-secondary: #4cc9f0;
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --color-danger: #f87171;
+  --color-gray-50: #f9fafb;
+  --color-gray-100: #f3f4f6;
+  --color-gray-200: #e5e7eb;
+  --color-gray-300: #d1d5db;
+  --color-gray-400: #9ca3af;
+  --color-gray-500: #6b7280;
+  --color-gray-600: #4b5563;
+  --color-gray-700: #374151;
+  --color-gray-800: #1f2937;
+  --color-gray-900: #111827;
+
+  /* Spacing system */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --space-12: 3rem;
+  --space-16: 4rem;
+
+  /* Shadow system */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+
+  /* Border radius */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-full: 9999px;
+
+  /* Animation */
+  --transition-fast: 150ms;
+  --transition-normal: 250ms;
+}
+
+/* Base styles */
+html {
+  font-size: 16px;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+  color: var(--color-gray-800);
+  background-color: var(--color-gray-50);
+  line-height: 1.5;
+  margin: 0;
+  padding: var(--space-2);
+}
+
+.container {
+  max-width: 96vw;
+  width: 96vw;
+  margin: 0 auto;
+  padding: var(--space-4);
+  background-color: white;
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+  /* Prevent child elements from protruding */
+  box-sizing: border-box;
+}
+
+/* Optimize for 16:9 full-screen usage - use almost entire screen */
+@media (min-width: 2560px) {
+  body {
+    padding: var(--space-3);
+  }
+
+  .container {
+    max-width: 94vw;
+    width: 94vw;
+    padding: var(--space-6);
+  }
+}
+
+@media (min-width: 1920px) and (max-width: 2559px) {
+  body {
+    padding: var(--space-2);
+  }
+
+  .container {
+    max-width: 95vw;
+    width: 95vw;
+    padding: var(--space-4);
+  }
+}
+
+@media (min-width: 1366px) and (max-width: 1919px) {
+  body {
+    padding: var(--space-2);
+  }
+
+  .container {
+    max-width: 96vw;
+    width: 96vw;
+    padding: var(--space-4);
+  }
+}
+
+/* For smaller 16:9 screens */
+@media (max-width: 1365px) {
+  body {
+    padding: var(--space-1);
+  }
+
+  .container {
+    max-width: 98vw;
+    width: 98vw;
+    padding: var(--space-3);
+  }
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin-top: 0;
+  line-height: 1.25;
+  color: var(--color-gray-900);
+  font-weight: 600;
+}
+
+h1 {
+  font-size: 1.875rem;
+  margin-bottom: var(--space-6);
+  border-bottom: 1px solid var(--color-gray-200);
+  padding-bottom: var(--space-4);
+}
+
+h2 {
+  font-size: 1.5rem;
+  margin-bottom: var(--space-4);
+  position: relative;
+}
+
+h3 {
+  font-size: 1.25rem;
+  margin-bottom: var(--space-3);
+}
+
+a {
+  color: var(--color-primary);
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+p {
+  margin-top: 0;
+  margin-bottom: var(--space-4);
+}
+
+/* Chart section - full width with adjusted padding and overflow protection */
+.chart-section {
+  background-color: white;
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: var(--space-2);
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/* Chart canvas - ensure proper height and margins with container constraints */
+#similarityChart {
+  width: 100% !important;
+  max-width: 100% !important;
+  height: 280px !important;
+  margin-bottom: 0;
+  border-radius: var(--radius-md);
+  background-color: white;
+  box-sizing: border-box;
+}
+
+/* Increase chart height on larger screens for better data visualization */
+@media (min-width: 1366px) {
+  #similarityChart {
+    height: 350px !important;
+  }
+}
+
+@media (min-width: 1920px) {
+  #similarityChart {
+    height: 400px !important;
+  }
+}
+
+/* Target slider section with improved layout and overflow protection */
+.target-slider-section {
+  background-color: white;
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: var(--space-4);
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/* Adjust target slider value to appear above slider instead of beside it */
+.target-slider-container .slider-with-value {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.target-slider-container .slider-value {
+  order: -1;
+  /* Move before slider */
+  margin-bottom: var(--space-1);
+  display: inline-block;
+  background: none;
+  color: var(--color-gray-700);
+  font-size: 0.875rem;
+  font-weight: 500;
+  padding: 0;
+  min-width: auto;
+}
+
+/* Adjust the slider itself to take full width within container */
+.target-slider-container input[type="range"] {
+  width: 100%;
+  max-width: 100%;
+  margin: var(--space-1) 0;
+  box-sizing: border-box;
+}
+
+/* Target slider container to ensure slider takes most space */
+.target-slider-container {
+  width: 100%;
+  max-width: 100%;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+/* Cache section - separate from slider and graph */
+.cache-info-section {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  background-color: white;
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: var(--space-8);
+}
+
+.cache-info-section .checkbox-group {
+  margin-bottom: 0;
+  margin-right: var(--space-4);
+}
+
+.cache-stats {
+  display: flex;
+  gap: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.cache-status.compact,
+.cache-status-global.compact {
+  margin-bottom: 0;
+  white-space: nowrap;
+}
+
+/* If there's an error message, make it full width */
+.cache-info-section .current-error {
+  flex-basis: 100%;
+  margin-top: var(--space-3);
+  margin-bottom: 0;
+}
+
+/* Remove the old target-section styles */
+/* .target-section and related styles can be removed */
+
+/* Control panel styles */
+.control-panel {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-6);
+}
+
+@media (min-width: 768px) {
+  .control-panel {
+    grid-template-columns: 1fr;
+  }
+}
+
+.settings-section,
+.status-section {
+  background-color: white;
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Top controls for lap and player count */
+.top-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+  padding: var(--space-4);
+  background-color: white;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Use more horizontal space on larger screens */
+@media (min-width: 1366px) {
+  .top-controls {
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: var(--space-6);
+  }
+}
+
+@media (min-width: 1920px) {
+  .top-controls {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: var(--space-8);
+  }
+}
+
+/* Form elements */
+.form-group {
+  margin-bottom: var(--space-6);
+}
+
+label {
+  display: block;
+  font-weight: 500;
+  margin-bottom: var(--space-2);
+  font-size: 0.875rem;
+  color: var(--color-gray-700);
+}
+
+input[type="range"] {
+  width: 100%;
+  height: 6px;
+  background: var(--color-gray-200);
+  outline: none;
+  border-radius: var(--radius-full);
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  width: 18px;
+  height: 18px;
+  background: var(--color-primary);
+  cursor: pointer;
+  border-radius: 50%;
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--transition-fast), background var(--transition-fast);
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.1);
+  background: var(--color-primary-light);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  background: var(--color-primary);
+  cursor: pointer;
+  border-radius: 50%;
+  border: none;
+  box-shadow: var(--shadow-sm);
+  transition: transform var(--transition-fast), background var(--transition-fast);
+}
+
+input[type="range"]::-moz-range-thumb:hover {
+  transform: scale(1.1);
+  background: var(--color-primary-light);
+}
+
+input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin-right: var(--space-2);
+  vertical-align: middle;
+  cursor: pointer;
+  accent-color: var(--color-primary);
+}
+
+.checkbox-group {
+  display: flex;
+  align-items: center;
+}
+
+.checkbox-group label {
+  display: flex;
+  align-items: center;
+  margin-bottom: 0;
+  cursor: pointer;
+}
+
+/* Number input styling */
+input[type="number"] {
+  padding: 8px 12px;
+  border: 1px solid var(--color-gray-300);
+  border-radius: var(--radius-md);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  color: var(--color-gray-900);
+  background-color: #ffffff;
+  transition: border-color 150ms, box-shadow 150ms;
+  width: 120px;
+  text-align: center;
+}
+
+input[type="number"]:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.1);
+}
+
+input[type="number"]:hover {
+  border-color: var(--color-gray-400);
+}
+
+/* Text input styling */
+input[type="text"] {
+  padding: 8px 12px;
+  border: 1px solid var(--color-gray-300);
+  border-radius: var(--radius-md);
+  font-size: 0.875rem;
+  line-height: 1.25rem;
+  color: var(--color-gray-900);
+  background-color: #ffffff;
+  transition: border-color 150ms, box-shadow 150ms;
+  width: 120px;
+  text-align: center;
+}
+
+input[type="text"]:focus {
+  outline: none;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.1);
+}
+
+input[type="text"]:hover {
+  border-color: var(--color-gray-400);
+}
+
+/* Validation states */
+input.invalid {
+  border-color: var(--color-danger);
+  background-color: #fef2f2;
+}
+
+input.invalid:focus {
+  border-color: var(--color-danger);
+  box-shadow: 0 0 0 3px rgba(248, 113, 113, 0.1);
+}
+
+.input-group {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.input-error {
+  font-size: 0.75rem;
+  color: var(--color-danger);
+  margin-top: var(--space-1);
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.input-error::before {
+  content: "⚠";
+  font-size: 0.875rem;
+}
+
+.slider-with-value {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.slider-value {
+  display: inline-block;
+  background-color: var(--color-primary);
+  color: white;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: 0.75rem;
+  min-width: 3rem;
+  text-align: center;
+}
+
+.slider-info {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--color-gray-500);
+  margin-top: var(--space-1);
+}
+
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-3) var(--space-6);
+  background-color: var(--color-primary);
+  color: white;
+  border: none;
+  border-radius: var(--radius-md);
+  font-weight: 500;
+  font-size: 0.875rem;
+  cursor: pointer;
+  transition: background-color var(--transition-fast), transform var(--transition-fast);
+}
+
+button:hover {
+  background-color: var(--color-primary-dark);
+  transform: translateY(-1px);
+}
+
+button:active {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  background-color: var(--color-gray-300);
+  color: var(--color-gray-500);
+  cursor: not-allowed;
+  transform: none;
+}
+
+/* Button variants */
+.btn-secondary {
+  background-color: var(--color-gray-200);
+  color: var(--color-gray-700);
+}
+
+.btn-secondary:hover {
+  background-color: var(--color-gray-300);
+  color: var(--color-gray-800);
+}
+
+.small {
+  padding: var(--space-2) var(--space-4);
+  font-size: 0.75rem;
+}
+
+/* Status notifications */
+.card {
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.cache-status {
+  background-color: rgba(67, 97, 238, 0.08);
+  color: var(--color-primary-dark);
+  border: 1px solid rgba(67, 97, 238, 0.2);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  font-size: 0.875rem;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.cache-status::before {
+  content: "ℹ️";
+  font-size: 1rem;
+}
+
+.cache-error-status {
+  background-color: rgba(248, 113, 113, 0.08);
+  color: var(--color-danger);
+  border: 1px solid rgba(248, 113, 113, 0.2);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  font-size: 0.875rem;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.cache-error-status::before {
+  content: "⚠️";
+  font-size: 1rem;
+}
+
+.cache-failed-targets {
+  background-color: rgba(251, 191, 36, 0.08);
+  color: var(--color-warning);
+  border: 1px solid rgba(251, 191, 36, 0.2);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  font-size: 0.875rem;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.cache-failed-targets::before {
+  content: "⚠️";
+  font-size: 1rem;
+}
+
+.cache-status-global {
+  background-color: rgba(76, 201, 240, 0.08);
+  color: var(--color-secondary);
+  border: 1px solid rgba(76, 201, 240, 0.2);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  font-size: 0.875rem;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.cache-status-global::before {
+  content: "📊";
+  font-size: 1rem;
+}
+
+.current-error {
+  background-color: rgba(248, 113, 113, 0.08);
+  color: var(--color-danger);
+  border: 1px solid rgba(248, 113, 113, 0.2);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  font-weight: 500;
+}
+
+.similarity-status {
+  background-color: rgba(76, 201, 240, 0.1);
+  color: #1a82a3;
+  border: 1px solid rgba(76, 201, 240, 0.2);
+  border-radius: var(--radius-md);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  font-weight: 500;
+  display: inline-block;
+}
+
+.calculating-status {
+  display: flex;
+  align-items: center;
+  padding: var(--space-3);
+  background-color: rgba(67, 97, 238, 0.1);
+  color: var(--color-primary-dark);
+  border-radius: var(--radius-md);
+  font-size: 0.875rem;
+  margin-top: var(--space-4);
+  font-weight: 500;
+}
+
+/* Results section */
+.results {
+  margin-top: var(--space-8);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--color-gray-200);
+}
+
+.no-results-message {
+  text-align: center;
+  padding: var(--space-8);
+  color: var(--color-gray-500);
+  background-color: var(--color-gray-50);
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--color-gray-300);
+}
+
+/* Table styles for large datasets */
+.result-sets {
+  margin-top: var(--space-6);
+}
+
+.big-car-table-container {
+  overflow-x: auto;
+  max-height: 600px;
+  overflow-y: auto;
+  border: 1px solid var(--color-gray-200);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  position: relative;
+  width: 100%;
+  /* Add width to ensure container takes full available space */
+}
+
+/* Increase table height on larger screens for better data viewing */
+@media (min-width: 1366px) {
+  .big-car-table-container {
+    max-height: 700px;
+  }
+}
+
+@media (min-width: 1920px) {
+  .big-car-table-container {
+    max-height: 800px;
+  }
+}
+
+.big-car-table {
+  width: max-content;
+  /* Allow table to expand to its natural size */
+  min-width: 100%;
+  /* But at least take the full container width */
+  border-collapse: separate;
+  border-spacing: 0;
+  font-size: 0.875rem;
+  table-layout: auto;
+  /* Changed from fixed to auto for natural column sizing */
+}
+
+.big-car-table thead {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background-color: var(--color-gray-100);
+}
+
+.big-car-table th {
+  padding: var(--space-3) var(--space-2);
+  text-align: left;
+  font-weight: 600;
+  color: var(--color-gray-700);
+  border-bottom: 2px solid var(--color-gray-300);
+  white-space: nowrap;
+  min-width: 100px;
+  /* Ensure minimum width for all columns */
+}
+
+.big-car-table th:first-child {
+  min-width: 60px;
+  /* Set # column to be narrower */
+}
+
+.big-car-table th:nth-child(3) {
+  min-width: 120px;
+  /* Make % difference column a bit wider */
+}
+
+.big-car-table td {
+  padding: var(--space-2) var(--space-3);
+  /* Increased horizontal padding */
+  border-bottom: 1px solid var(--color-gray-200);
+  white-space: nowrap;
+}
+
+.big-car-table tbody tr:hover {
+  background-color: var(--color-gray-50);
+}
+
+.big-car-table th:first-child,
+.big-car-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 5;
+  background-color: white;
+  border-right: 1px solid var(--color-gray-200);
+}
+
+.big-car-table tbody tr:hover td:first-child {
+  background-color: var(--color-gray-50);
+}
+
+
+/* Responsive design for settings section */
+@media (max-width: 768px) {
+  .settings-header {
+    padding: var(--space-2) var(--space-3);
+  }
+
+  .settings-toggle {
+    gap: var(--space-2);
+    padding: var(--space-1);
+  }
+
+  .settings-title {
+    font-size: 0.8rem;
+  }
+
+  .settings-content {
+    padding: var(--space-3);
+  }
+
+  .settings-content .cache-stats {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+  }
+
+  .settings-content .cache-stats .cache-status.compact,
+  .settings-content .cache-stats .cache-status-global.compact {
+    min-width: auto;
+    text-align: center;
+    padding: var(--space-1);
+    background-color: var(--color-gray-100);
+    border-radius: var(--radius-sm);
+  }
+
+  .settings-summary {
+    flex-direction: column;
+    gap: var(--space-1);
+    align-items: flex-end;
+  }
+
+  .cache-summary {
+    font-size: 0.7rem;
+  }
+}
+
+/* Loading spinner */
+@keyframes spin {
+  0% {
+    transform: rotate(0deg);
+  }
+
+  100% {
+    transform: rotate(360deg);
+  }
+}
+
+.loading-spinner {
+  display: inline-block;
+  width: 24px;
+  height: 24px;
+  border: 3px solid rgba(67, 97, 238, 0.2);
+  border-radius: 50%;
+  border-top-color: var(--color-primary);
+  animation: spin 1s linear infinite;
+  margin-right: var(--space-2);
+}
+
+/* Settings Section - Collapsible Cache Section */
+.cache-section {
+  background-color: white;
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  margin-bottom: var(--space-8);
+  border: 1px solid var(--color-gray-200);
+  overflow: hidden;
+  transition: all var(--transition-normal) ease;
+}
+
+/* Enhanced visual feedback and accessibility */
+.cache-section:focus-within {
+  box-shadow: var(--shadow-md);
+  border-color: var(--color-primary-light);
+}
+
+.settings-toggle:focus {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+.settings-content .btn-secondary.small:focus {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+}
+
+/* Add subtle animation when cache section opens/closes */
+.settings-content {
+  transform-origin: top;
+}
+
+/* Visual indicator for active state */
+.cache-section:hover {
+  border-color: var(--color-gray-300);
+}
+
+/* Better visual separation for cache stats */
+.settings-content .cache-stats {
+  position: relative;
+}
+
+.settings-content .cache-stats::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: var(--space-3);
+  right: var(--space-3);
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--color-gray-300), transparent);
+  transform: translateY(-1px);
+}
+
+/* Settings Header */
+.settings-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  background-color: var(--color-gray-50);
+  border-bottom: 1px solid var(--color-gray-200);
+  cursor: pointer;
+  transition: background-color var(--transition-fast) ease;
+}
+
+.settings-header:hover {
+  background-color: var(--color-gray-100);
+}
+
+.settings-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  background: none;
+  border: none;
+  padding: var(--space-2);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  font-weight: 500;
+  color: var(--color-gray-700);
+  transition: all var(--transition-fast) ease;
+  flex: 1;
+  text-align: left;
+}
+
+.settings-toggle:hover {
+  background-color: rgba(67, 97, 238, 0.08);
+  color: var(--color-primary);
+}
+
+.settings-icon {
+  font-size: 1.125rem;
+  line-height: 1;
+}
+
+.settings-title {
+  font-size: 0.875rem;
+  font-weight: 600;
+  flex: 1;
+}
+
+.settings-chevron {
+  display: inline-block;
+}
+
+.settings-chevron::before {
+  content: '▶';
+  font-size: 0.75rem;
+  color: var(--color-gray-500);
+  display: inline-block;
+  transition: transform var(--transition-fast) ease;
+  transform: rotate(0deg);
+}
+
+.settings-toggle[aria-expanded="true"] .settings-chevron::before {
+  transform: rotate(90deg);
+}
+
+/* Ensure cache summary stays vertically centered and doesn't wrap */
+.settings-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  font-size: 0.75rem;
+  color: var(--color-gray-600);
+  flex: 0 0 auto;
+  align-self: center;
+  white-space: nowrap;
+}
+
+/* Settings Content */
+.settings-content {
+  padding: var(--space-4);
+  background-color: white;
+  animation: slideDown var(--transition-normal) ease;
+}
+
+@keyframes slideDown {
+  from {
+    opacity: 0;
+    transform: translateY(-10px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Cache stats within settings */
+.settings-content .cache-stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background-color: var(--color-gray-50);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-gray-200);
+  margin-top: var(--space-4);
+}
+
+.settings-content .cache-stats .cache-status.compact,
+.settings-content .cache-stats .cache-status-global.compact {
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--color-gray-600);
+  flex: 1;
+  min-width: 120px;
+}
+
+.settings-content .cache-stats .btn-secondary.small {
+  background-color: var(--color-gray-300);
+  border: 1px solid var(--color-gray-400);
+  color: var(--color-gray-700);
+  padding: var(--space-2) var(--space-3);
+  font-size: 0.75rem;
+  font-weight: 500;
+  border-radius: var(--radius-sm);
+  transition: all var(--transition-fast) ease;
+  white-space: nowrap;
+}
+
+.settings-content .cache-stats .btn-secondary.small:hover {
+  background-color: var(--color-gray-400);
+  border-color: var(--color-gray-500);
+  color: var(--color-gray-800);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-sm);
+}
+
+/* Improve form layout in settings */
+.settings-content .form-group {
+  margin-bottom: var(--space-4);
+}
+
+.settings-content .form-group:last-of-type {
+  margin-bottom: var(--space-4);
+}
+
+/* Side-by-side layout for number inputs when there's space */
+.settings-content .form-row {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.settings-content .form-row .form-group {
+  margin-bottom: 0;
+}
+
+@media (min-width: 480px) {
+  .settings-content .form-row {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.settings-content .checkbox-group {
+  background-color: var(--color-gray-50);
+  padding: var(--space-3);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-gray-200);
+}
+
+.settings-content .checkbox-group label {
+  font-weight: 500;
+  color: var(--color-gray-700);
+  cursor: pointer;
+}
+
+.settings-content input[type="number"] {
+  width: 100%;
+  max-width: 120px;
+}
+
+.settings-content .current-error.compact {
+  margin-top: var(--space-3);
+  margin-bottom: 0;
+  font-size: 0.75rem;
+  padding: var(--space-2) var(--space-3);
+}

@@ -1,0 +1,17 @@
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C",
+    "link-arg=--import-memory",
+    "--cfg",
+    'getrandom_backend="wasm_js"',
+]
+
+[build]
+target = "wasm32-unknown-unknown"
+
+[profile.release]
+opt-level = "z"
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true
