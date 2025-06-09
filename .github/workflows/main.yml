@@ -21,8 +21,11 @@ jobs:
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
-      - name: Install Trunk
-        run: cargo install --locked trunk
+      - name: Install binstall
+        run: cargo install binstall
+
+      - name: Install Trunk using binstall
+        run: cargo binstall --locked trunk
 
       - name: Build
         # The --public-url is important for GitHub Pages
