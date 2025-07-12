@@ -13,6 +13,7 @@ use wasm_bindgen::prelude::*;
 pub mod defaults {
     pub const TIMEOUT_MS: f64 = 5000.0;
     pub const TOLERANCE_PERCENT: f64 = 0.5;
+    pub const TIME_BIAS_FACTOR: f64 = 1.0;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -130,6 +131,7 @@ fn handle_last_number(
     current_sum: u32,
     target: u32,
     tolerance_percent: f64,
+    time_bias_factor: f64,
 ) -> (CarIndex, u32) {
     let needed = target.saturating_sub(current_sum);
 
@@ -154,6 +156,7 @@ fn handle_last_number(
             false,
             target,
             1,
+            time_bias_factor,
         );
         return (fallback_idx, current_sum + get_lap_time(cars, fallback_idx));
     }
@@ -235,18 +238,26 @@ fn fallback_strategy(
     using_previous_cars: bool,
     target: u32,
     remaining_needed: usize,
+    time_bias_factor: f64,
 ) -> (CarIndex, bool) {
     // Use saturating_sub to avoid underflow when current_sum > target
     let remaining_target = target.saturating_sub(current_sum);
     let current_target_avg = if remaining_target == 0 {
-        0
+        0.0
     } else {
-        remaining_target / remaining_needed as u32
+        remaining_target as f64 / remaining_needed as f64
     };
 
-    // Sort to find the best match in current pool
+    // Sort to find the best match in current pool using bias factor for weighting
     candidates_for_current_selection
-        .sort_by_key(|&idx| (get_lap_time(cars, idx) as i32 - current_target_avg as i32).abs());
+        .sort_by(|&idx_a, &idx_b| {
+            let distance_a = (get_lap_time(cars, idx_a) as f64 - current_target_avg).abs();
+            let distance_b = (get_lap_time(cars, idx_b) as f64 - current_target_avg).abs();
+            // Apply bias factor to the comparison - higher bias makes closer distances more preferred
+            let weighted_distance_a = distance_a.powf(1.0 / time_bias_factor);
+            let weighted_distance_b = distance_b.powf(1.0 / time_bias_factor);
+            weighted_distance_a.partial_cmp(&weighted_distance_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
     let best_match_idx = candidates_for_current_selection[0];
 
     // Optionally consider previously selected numbers
@@ -260,19 +271,27 @@ fn fallback_strategy(
         if !available_previous.is_empty() {
             let best_previous_idx = *available_previous
                 .iter()
-                .min_by_key(|&&idx| {
-                    (get_lap_time(cars, idx) as i32 - current_target_avg as i32).abs()
+                .min_by(|&&idx_a, &&idx_b| {
+                    let distance_a = (get_lap_time(cars, idx_a) as f64 - current_target_avg).abs();
+                    let distance_b = (get_lap_time(cars, idx_b) as f64 - current_target_avg).abs();
+                    let weighted_distance_a = distance_a.powf(1.0 / time_bias_factor);
+                    let weighted_distance_b = distance_b.powf(1.0 / time_bias_factor);
+                    weighted_distance_a.partial_cmp(&weighted_distance_b).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
 
             let best_match_diff =
-                (get_lap_time(cars, best_match_idx) as i32 - current_target_avg as i32).abs();
+                (get_lap_time(cars, best_match_idx) as f64 - current_target_avg).abs();
             let best_previous_diff =
-                (get_lap_time(cars, best_previous_idx) as i32 - current_target_avg as i32).abs();
+                (get_lap_time(cars, best_previous_idx) as f64 - current_target_avg).abs();
 
-            if best_previous_diff < best_match_diff {
+            // Apply bias factor to the comparison
+            let weighted_match_diff = best_match_diff.powf(1.0 / time_bias_factor);
+            let weighted_previous_diff = best_previous_diff.powf(1.0 / time_bias_factor);
+
+            if weighted_previous_diff < weighted_match_diff {
                 debug!(
-                    "Using previously selected number {} instead of {} (closer to target avg: {})",
+                    "Using previously selected number {} instead of {} (closer to target avg: {:.2})",
                     get_lap_time(cars, best_previous_idx),
                     get_lap_time(cars, best_match_idx),
                     current_target_avg
@@ -333,6 +352,7 @@ pub fn find_approximate_subset(
     lap_count: usize,
     previously_selected: &HashSet<CarIndex>,
     tolerance_percent: f64,
+    time_bias_factor: f64,
 ) -> Result<Vec<CarIndex>, SubsetError> {
     let mut rng = rand::rng();
 
@@ -472,6 +492,7 @@ pub fn find_approximate_subset(
                 current_sum,
                 target,
                 tolerance_percent,
+                time_bias_factor,
             );
             selected.push(final_choice);
             break;
@@ -488,6 +509,7 @@ pub fn find_approximate_subset(
             remaining_needed,
             &mut rng,
             &mut total_backtracks,
+            time_bias_factor,
         );
 
         current_sum += get_lap_time(cars, chosen);
@@ -543,6 +565,7 @@ fn select_candidate(
     remaining_needed: usize,
     rng: &mut impl rand::Rng,
     total_backtracks: &mut u32,
+    time_bias_factor: f64,
 ) -> CarIndex {
     let (min_possible_remaining, max_possible_remaining) =
         calculate_min_max_sums(cars, candidates_for_current_selection, remaining_needed - 1);
@@ -568,15 +591,20 @@ fn select_candidate(
     if !filtered.is_empty() {
         let needed_avg = (target.saturating_sub(current_sum)) as f64 / (remaining_needed as f64);
         debug!(
-            "Needed average for next number: {} ({}% of target)",
+            "Needed average for next number: {:.2} ({}% of target, bias: {:.2})",
             needed_avg,
-            (needed_avg / target as f64 * 100.0)
+            (needed_avg / target as f64 * 100.0),
+            time_bias_factor
         );
 
         // Build weights paralleling `filtered` so indices match 1-to-1
+        // Use bias_factor to control how strongly we prefer cars close to the average
         let weights = filtered
             .iter()
-            .map(|&idx| 1.0 / ((get_lap_time(cars, idx) as f64 - needed_avg).abs() + 1.0));
+            .map(|&idx| {
+                let distance = (get_lap_time(cars, idx) as f64 - needed_avg).abs();
+                1.0 / ((distance + 1.0).powf(time_bias_factor))
+            });
 
         let dist = WeightedIndex::new(weights).expect("Non-empty filtered vec guarantees Ok");
 
@@ -594,6 +622,7 @@ fn select_candidate(
         using_previous_cars,
         target,
         remaining_needed,
+        time_bias_factor,
     );
     if used_backtrack {
         *total_backtracks += 1;
@@ -846,6 +875,7 @@ pub fn perform_multiple_runs(
     player_count: usize,
     timeout_ms: f64,
     tolerance_percent: f64,
+    time_bias_factor: f64,
 ) -> Result<Vec<Vec<CarIndex>>, SubsetError> {
     // ---------- timeout set-up ----------
     // Use the provided timeout instead of hardcoded value
@@ -906,6 +936,7 @@ pub fn perform_multiple_runs(
                 lap_count,
                 &previously_selected,
                 tolerance_percent,
+                time_bias_factor,
             ) {
                 Ok(subset) => subset,
                 Err(err) => {
@@ -1123,6 +1154,7 @@ pub async fn worker_perform_multiple_runs(
         player_count,
         defaults::TIMEOUT_MS,
         defaults::TOLERANCE_PERCENT,
+        defaults::TIME_BIAS_FACTOR,
     ) {
         Ok(result) => serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL),
         Err(e) => serde_wasm_bindgen::to_value(&format!("Calculation failed: {}", e))

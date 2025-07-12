@@ -10,12 +10,15 @@ pub const DEFAULT_PLAYER_COUNT: usize = 32;
 pub const DEFAULT_TARGET_MS: u32 = 2_800_000;
 pub const DEFAULT_TIMEOUT_SEC: f64 = 5.0;
 pub const DEFAULT_TOLERANCE_PCT: f64 = 0.5;
+pub const DEFAULT_TIME_BIAS_FACTOR: f64 = 1.0;
 
 // Min/Max limits for input fields
 pub const MIN_TIMEOUT_SEC: f64 = 1.0;
 pub const MAX_TIMEOUT_SEC: f64 = 30.0;
 pub const MIN_TOLERANCE_PCT: f64 = 0.1;
 pub const MAX_TOLERANCE_PCT: f64 = 5.0;
+pub const MIN_TIME_BIAS_FACTOR: f64 = 0.5;
+pub const MAX_TIME_BIAS_FACTOR: f64 = 2.0;
 pub const MAX_PLAYER_COUNT: usize = 250;
 
 // UI constants
