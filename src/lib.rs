@@ -245,12 +245,19 @@ fn fallback_strategy(
     let current_target_avg = if remaining_target == 0 {
         0.0
     } else {
-        (remaining_target as f64 / remaining_needed as f64) * time_bias_factor
+        remaining_target as f64 / remaining_needed as f64
     };
 
-    // Sort to find the best match in current pool
+    // Sort to find the best match in current pool using bias factor for weighting
     candidates_for_current_selection
-        .sort_by_key(|&idx| (get_lap_time(cars, idx) as f64 - current_target_avg).abs() as u32);
+        .sort_by(|&idx_a, &idx_b| {
+            let distance_a = (get_lap_time(cars, idx_a) as f64 - current_target_avg).abs();
+            let distance_b = (get_lap_time(cars, idx_b) as f64 - current_target_avg).abs();
+            // Apply bias factor to the comparison - higher bias makes closer distances more preferred
+            let weighted_distance_a = distance_a.powf(1.0 / time_bias_factor);
+            let weighted_distance_b = distance_b.powf(1.0 / time_bias_factor);
+            weighted_distance_a.partial_cmp(&weighted_distance_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
     let best_match_idx = candidates_for_current_selection[0];
 
     // Optionally consider previously selected numbers
@@ -264,8 +271,12 @@ fn fallback_strategy(
         if !available_previous.is_empty() {
             let best_previous_idx = *available_previous
                 .iter()
-                .min_by_key(|&&idx| {
-                    (get_lap_time(cars, idx) as f64 - current_target_avg).abs() as u32
+                .min_by(|&&idx_a, &&idx_b| {
+                    let distance_a = (get_lap_time(cars, idx_a) as f64 - current_target_avg).abs();
+                    let distance_b = (get_lap_time(cars, idx_b) as f64 - current_target_avg).abs();
+                    let weighted_distance_a = distance_a.powf(1.0 / time_bias_factor);
+                    let weighted_distance_b = distance_b.powf(1.0 / time_bias_factor);
+                    weighted_distance_a.partial_cmp(&weighted_distance_b).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .unwrap();
 
@@ -274,7 +285,11 @@ fn fallback_strategy(
             let best_previous_diff =
                 (get_lap_time(cars, best_previous_idx) as f64 - current_target_avg).abs();
 
-            if best_previous_diff < best_match_diff {
+            // Apply bias factor to the comparison
+            let weighted_match_diff = best_match_diff.powf(1.0 / time_bias_factor);
+            let weighted_previous_diff = best_previous_diff.powf(1.0 / time_bias_factor);
+
+            if weighted_previous_diff < weighted_match_diff {
                 debug!(
                     "Using previously selected number {} instead of {} (closer to target avg: {:.2})",
                     get_lap_time(cars, best_previous_idx),
@@ -574,7 +589,7 @@ fn select_candidate(
         .collect();
 
     if !filtered.is_empty() {
-        let needed_avg = ((target.saturating_sub(current_sum)) as f64 / (remaining_needed as f64)) * time_bias_factor;
+        let needed_avg = (target.saturating_sub(current_sum)) as f64 / (remaining_needed as f64);
         debug!(
             "Needed average for next number: {:.2} ({}% of target, bias: {:.2})",
             needed_avg,
@@ -583,9 +598,13 @@ fn select_candidate(
         );
 
         // Build weights paralleling `filtered` so indices match 1-to-1
+        // Use bias_factor to control how strongly we prefer cars close to the average
         let weights = filtered
             .iter()
-            .map(|&idx| 1.0 / ((get_lap_time(cars, idx) as f64 - needed_avg).abs() + 1.0));
+            .map(|&idx| {
+                let distance = (get_lap_time(cars, idx) as f64 - needed_avg).abs();
+                1.0 / ((distance + 1.0).powf(time_bias_factor))
+            });
 
         let dist = WeightedIndex::new(weights).expect("Non-empty filtered vec guarantees Ok");
 

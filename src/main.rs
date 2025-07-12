@@ -40,8 +40,8 @@ use utils::{
 type CacheKey = (u32, usize, usize); // (target_ms, lap_count, player_count)
 type CacheValue = (Vec<Vec<usize>>, f64, u32); // (results, similarity, calculated_target)
 
-// Get optimal worker count once
-const WORKER_COUNT: usize = {
+// Get optimal worker count
+fn get_worker_count() -> usize {
     #[cfg(target_arch = "wasm32")]
     {
         4 // Default for WASM since we can't call web APIs in const context
@@ -52,7 +52,7 @@ const WORKER_COUNT: usize = {
             .map(|n| n.get())
             .unwrap_or(4)
     }
-};
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helper functions
@@ -141,8 +141,10 @@ fn run_precache(
     let step = base_target_step(min, max);
     let order = Rc::new(spread_indices(SLIDER_MAX_INDEX + 1));
 
+    let worker_count = get_worker_count();
+
     // Spawn task for each worker
-    for worker_idx in 0..WORKER_COUNT {
+    for worker_idx in 0..worker_count {
         let cars_loop = cars.clone();
         let token_ref = token_ref.clone();
         let cache_version = cache_version.clone();
@@ -153,7 +155,7 @@ fn run_precache(
         wasm_bindgen_futures::spawn_local(async move {
             let mut bridge = <KarmaTask as Spawnable>::spawner().spawn(WORKER_SCRIPT);
 
-            for pos in (worker_idx..order.len()).step_by(WORKER_COUNT) {
+            for pos in (worker_idx..order.len()).step_by(worker_count) {
                 let idx = order[pos];
 
                 // Check if we should stop
@@ -1138,7 +1140,7 @@ fn main_component() -> Html {
                                 if let Some(ref err) = *time_bias_error {
                                     <div class="input-error">{ err }</div>
                                 }
-                                <div class="input-help">{ "1.0 = normal, < 1.0 = prefer faster cars, > 1.0 = prefer slower cars" }</div>
+                                <div class="input-help">{ "1.0 = normal bias strength, < 1.0 = more uniform selection, > 1.0 = stronger preference for average time" }</div>
                             </div>
                         </div>
 
