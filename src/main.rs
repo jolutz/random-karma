@@ -176,6 +176,7 @@ fn run_precache(
                     player_count: nr,
                     timeout_ms: timeout_secs * 1000.0,
                     tolerance_percent: tolerance_val,
+                    time_bias_factor: DEFAULT_TIME_BIAS_FACTOR, // Use default for precache
                 };
 
                 let _ = process_precache_target(
@@ -203,6 +204,7 @@ fn main_component() -> Html {
     let player_count = use_state(|| DEFAULT_PLAYER_COUNT);
     let timeout_seconds = use_state(|| DEFAULT_TIMEOUT_SEC);
     let tolerance_percent = use_state(|| DEFAULT_TOLERANCE_PCT);
+    let time_bias_factor = use_state(|| DEFAULT_TIME_BIAS_FACTOR);
 
     // Text states for input fields
     let lap_count_text = use_state(|| DEFAULT_LAP_COUNT.to_string());
@@ -210,6 +212,7 @@ fn main_component() -> Html {
     let target_text = use_state(|| format_ms_to_minsecms(DEFAULT_TARGET_MS));
     let timeout_seconds_text = use_state(|| DEFAULT_TIMEOUT_SEC.to_string());
     let tolerance_percent_text = use_state(|| DEFAULT_TOLERANCE_PCT.to_string());
+    let time_bias_factor_text = use_state(|| DEFAULT_TIME_BIAS_FACTOR.to_string());
 
     let results = use_state(|| None::<CacheValue>);
     let is_calculating = use_state(|| false);
@@ -245,6 +248,7 @@ fn main_component() -> Html {
     let target_error = use_state(|| None::<String>);
     let timeout_error = use_state(|| None::<String>);
     let tolerance_error = use_state(|| None::<String>);
+    let time_bias_error = use_state(|| None::<String>);
 
     // --- OnInput Handlers for Text States ---
     let lap_count_text_oninput = {
@@ -282,6 +286,13 @@ fn main_component() -> Html {
             tolerance_percent_text_setter.set(input.value());
         })
     };
+    let time_bias_factor_text_oninput = {
+        let time_bias_factor_text_setter = time_bias_factor_text.clone();
+        Callback::from(move |e: InputEvent| {
+            let input: HtmlInputElement = e.target_unchecked_into();
+            time_bias_factor_text_setter.set(input.value());
+        })
+    };
 
     // Load cars from CSV on mount
     {
@@ -301,6 +312,7 @@ fn main_component() -> Html {
         let player_count_state = player_count.clone();
         let timeout_state = timeout_seconds.clone();
         let tolerance_state = tolerance_percent.clone();
+        let time_bias_state = time_bias_factor.clone();
         let last_from_cache = last_from_cache.clone();
         let results = results.clone();
         let error_message = error_message.clone();
@@ -311,6 +323,7 @@ fn main_component() -> Html {
             let player_count = *player_count_state;
             let timeout_value = *timeout_state;
             let tolerance_value = *tolerance_state;
+            let time_bias_value = *time_bias_state;
 
             is_calculating.set(true);
 
@@ -331,6 +344,7 @@ fn main_component() -> Html {
                 player_count,
                 timeout_ms: timeout_value * 1000.0,
                 tolerance_percent: tolerance_value,
+                time_bias_factor: time_bias_value,
             };
             karma_sub.send(args);
             is_calculating.set(true);
@@ -707,6 +721,38 @@ fn main_component() -> Html {
         })
     };
 
+    let handle_time_bias_input = {
+        let time_bias_text_handle = time_bias_factor_text.clone();
+        let time_bias_num_handle = time_bias_factor.clone();
+        let time_bias_err_handle = time_bias_error.clone();
+
+        Callback::from(move |_: ()| {
+            let text_val = (*time_bias_text_handle).clone();
+            if text_val.trim().is_empty() {
+                // Allow empty commit to clear errors
+                time_bias_err_handle.set(None);
+                return;
+            }
+            match text_val.parse::<f64>() {
+                Ok(v) => {
+                    if (MIN_TIME_BIAS_FACTOR..=MAX_TIME_BIAS_FACTOR).contains(&v) {
+                        time_bias_err_handle.set(None);
+                        time_bias_num_handle.set(v);
+                        time_bias_text_handle.set(v.to_string());
+                    } else {
+                        time_bias_err_handle.set(Some(format!(
+                            "Time bias must be between {} and {}",
+                            MIN_TIME_BIAS_FACTOR, MAX_TIME_BIAS_FACTOR
+                        )));
+                    }
+                }
+                Err(_) => {
+                    time_bias_err_handle.set(Some("Invalid number".to_string()));
+                }
+            }
+        })
+    };
+
     // --- KeyDown Handlers for Enter Key ---
     let lap_count_onkeydown = {
         let commit_handler = handle_lap_count_input.clone();
@@ -742,6 +788,14 @@ fn main_component() -> Html {
     };
     let tolerance_onkeydown = {
         let commit_handler = handle_tolerance_input.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" {
+                commit_handler.emit(());
+            }
+        })
+    };
+    let time_bias_onkeydown = {
+        let commit_handler = handle_time_bias_input.clone();
         Callback::from(move |e: KeyboardEvent| {
             if e.key() == "Enter" {
                 commit_handler.emit(());
@@ -811,6 +865,20 @@ fn main_component() -> Html {
         let num_val = *tolerance_percent;
         let text_setter = tolerance_percent_text.clone();
         let error_setter = tolerance_error.clone();
+        use_effect_with(num_val, move |&current_num_val| {
+            let num_as_string = current_num_val.to_string();
+            if *text_setter != num_as_string {
+                text_setter.set(num_as_string);
+                error_setter.set(None);
+            }
+            || ()
+        });
+    }
+    {
+        // Sync time_bias_factor -> time_bias_factor_text
+        let num_val = *time_bias_factor;
+        let text_setter = time_bias_factor_text.clone();
+        let error_setter = time_bias_error.clone();
         use_effect_with(num_val, move |&current_num_val| {
             let num_as_string = current_num_val.to_string();
             if *text_setter != num_as_string {
@@ -1047,6 +1115,30 @@ fn main_component() -> Html {
                                 if let Some(ref err) = *tolerance_error {
                                     <div class="input-error">{ err }</div>
                                 }
+                            </div>
+                        </div>
+
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="time_bias_factor_text_input">{ "Time Bias Factor:" }</label>
+                                // Custom input for time_bias_factor
+                                <input
+                                    type="number"
+                                    id="time_bias_factor_text_input"
+                                    step="0.1"
+                                    min={MIN_TIME_BIAS_FACTOR.to_string()}
+                                    max={MAX_TIME_BIAS_FACTOR.to_string()}
+                                    value={(*time_bias_factor_text).clone()}
+                                    class={if (*time_bias_error).is_some() { "invalid" } else { "" }}
+                                    placeholder={DEFAULT_TIME_BIAS_FACTOR.to_string()}
+                                    oninput={time_bias_factor_text_oninput}
+                                    onchange={handle_time_bias_input.reform(|_|())}
+                                    onkeydown={time_bias_onkeydown}
+                                />
+                                if let Some(ref err) = *time_bias_error {
+                                    <div class="input-error">{ err }</div>
+                                }
+                                <div class="input-help">{ "1.0 = normal, < 1.0 = prefer faster cars, > 1.0 = prefer slower cars" }</div>
                             </div>
                         </div>
 

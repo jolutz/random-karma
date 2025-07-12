@@ -15,6 +15,7 @@ pub struct KarmaArgs {
     pub player_count: usize,
     pub timeout_ms: f64,
     pub tolerance_percent: f64,
+    pub time_bias_factor: f64,
 }
 
 /// Result type for karma calculation containing subsets, similarity, target, lap count, and player count.
@@ -36,6 +37,7 @@ pub async fn KarmaTask(mut scope: ReactorScope<KarmaArgs, KarmaResult>) {
                 args.player_count,
                 args.timeout_ms,
                 args.tolerance_percent,
+                args.time_bias_factor,
             )
             .map_err(|e| format!("{}", e))?;
 
