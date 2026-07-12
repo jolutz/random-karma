@@ -4,6 +4,7 @@
 //! that can affect a result. The cache is deliberately bounded so exploring
 //! many combinations cannot grow browser memory without limit.
 
+use random_karma::SolverStrategy;
 use std::cell::RefCell;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 
@@ -22,6 +23,7 @@ pub struct CacheKey {
     pub player_count: usize,
     pub tolerance_percent_bits: u64,
     pub timeout_ms_bits: u64,
+    pub strategy: SolverStrategy,
 }
 
 impl CacheKey {
@@ -32,6 +34,7 @@ impl CacheKey {
         player_count: usize,
         tolerance_percent: f64,
         timeout_ms: f64,
+        strategy: SolverStrategy,
     ) -> Self {
         Self {
             dataset_generation,
@@ -40,6 +43,7 @@ impl CacheKey {
             player_count,
             tolerance_percent_bits: tolerance_percent.to_bits(),
             timeout_ms_bits: timeout_ms.to_bits(),
+            strategy,
         }
     }
 }
@@ -136,7 +140,7 @@ mod tests {
     use super::*;
 
     fn key(target_ms: u32) -> CacheKey {
-        CacheKey::new(0, target_ms, 1, 1, 0.5, 1_000.0)
+        CacheKey::new(0, target_ms, 1, 1, 0.5, 1_000.0, SolverStrategy::Bounded)
     }
 
     fn value(target_ms: u32) -> CacheValue {
@@ -158,6 +162,21 @@ mod tests {
         assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
         assert!(cache.get(&key(0)).is_none());
         assert!(cache.get(&key(MAX_CACHE_ENTRIES as u32)).is_some());
+    }
+
+    #[test]
+    fn strategies_use_distinct_entries() {
+        let mut cache = CacheStore::new();
+        let bounded = key(1);
+        let mut legacy = bounded.clone();
+        legacy.strategy = SolverStrategy::Legacy;
+
+        cache.insert(bounded.clone(), value(1));
+        cache.insert(legacy.clone(), value(2));
+
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get(&bounded).unwrap().2, 1);
+        assert_eq!(cache.get(&legacy).unwrap().2, 2);
     }
 
     #[test]

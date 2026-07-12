@@ -13,6 +13,7 @@ pub fn cache_key(metadata: &RequestMetadata) -> CacheKey {
         metadata.player_count,
         metadata.tolerance_percent,
         metadata.timeout_ms,
+        metadata.strategy,
     )
 }
 

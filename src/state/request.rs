@@ -1,4 +1,4 @@
-use random_karma::worker_agent::RequestMetadata;
+use random_karma::{worker_agent::RequestMetadata, SolverStrategy};
 
 /// Monotonic identities used to correlate worker responses and invalidate datasets.
 #[derive(Debug, Default)]
@@ -16,6 +16,7 @@ impl RequestState {
         player_count: usize,
         timeout_ms: f64,
         tolerance_percent: f64,
+        strategy: SolverStrategy,
     ) -> RequestMetadata {
         self.next_request_id = self.next_request_id.wrapping_add(1);
         let metadata = RequestMetadata {
@@ -26,6 +27,7 @@ impl RequestState {
             player_count,
             timeout_ms,
             tolerance_percent,
+            strategy,
         };
         self.active = Some(metadata.clone());
         metadata
@@ -61,7 +63,7 @@ mod tests {
     use super::*;
 
     fn begin(state: &mut RequestState, target: u32) -> RequestMetadata {
-        state.begin(target, 2, 3, 1_000.0, 0.5)
+        state.begin(target, 2, 3, 1_000.0, 0.5, SolverStrategy::Bounded)
     }
 
     #[test]

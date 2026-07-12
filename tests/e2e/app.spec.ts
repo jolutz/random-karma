@@ -24,6 +24,9 @@ test('loads the application with its default controls', async ({ page }) => {
   await expect(page.getByLabel('Player Count:')).toHaveValue('32');
   await expect(page.getByLabel('Target Time:')).toBeVisible();
   await expect(page.locator('.settings-summary')).toContainText(/Cache: \d+\/100/);
+  await openSettings(page);
+  await expect(page.getByRole('radio', { name: /Bounded/ })).toBeChecked();
+  await expect(page.getByRole('radio', { name: /Legacy/ })).not.toBeChecked();
 });
 
 test('applies parameter changes and reaches a completed calculation state', async ({ page }) => {
@@ -53,6 +56,19 @@ test('opens settings, changes a solver setting, and clears the cache', async ({ 
 
   await page.getByRole('button', { name: 'Clear Cache' }).click();
   await expect(page.locator('.cache-status-global')).toHaveText('Total entries: 0');
+});
+
+test('switches solver strategy and recalculates with separate state', async ({ page }) => {
+  await page.goto('./');
+  await disablePrecaching(page);
+
+  const bounded = page.getByRole('radio', { name: /Bounded/ });
+  const legacy = page.getByRole('radio', { name: /Legacy/ });
+  await expect(bounded).toBeChecked();
+  await legacy.check();
+  await expect(legacy).toBeChecked();
+  await expect(bounded).not.toBeChecked();
+  await expect(page.locator('.loading-indicator')).toBeHidden({ timeout: 15_000 });
 });
 
 test('replaces the dataset from mocked clipboard text', async ({ page, context }) => {

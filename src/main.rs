@@ -6,7 +6,7 @@ use gloo_timers::callback::Timeout;
 use random_karma::{
     format_ms_to_minsecms, get_target_range_for_subset, read_cars_from_csv_string,
     worker_agent::{KarmaArgs, RequestMetadata},
-    Car,
+    Car, SolverStrategy,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -75,6 +75,7 @@ fn main_component() -> Html {
     let player_count = use_state(|| DEFAULT_PLAYER_COUNT);
     let timeout_seconds = use_state(|| DEFAULT_TIMEOUT_SEC);
     let tolerance_percent = use_state(|| DEFAULT_TOLERANCE_PCT);
+    let solver_strategy = use_state(|| SolverStrategy::Bounded);
 
     // Text states for input fields
     let lap_count_text = use_state(|| DEFAULT_LAP_COUNT.to_string());
@@ -177,6 +178,7 @@ fn main_component() -> Html {
         let player_count_state = player_count.clone();
         let timeout_state = timeout_seconds.clone();
         let tolerance_state = tolerance_percent.clone();
+        let strategy_state = solver_strategy.clone();
         let last_from_cache = last_from_cache.clone();
         let results = results.clone();
         let error_message = error_message.clone();
@@ -195,6 +197,7 @@ fn main_component() -> Html {
                 *player_count_state,
                 *timeout_state * 1000.0,
                 *tolerance_state,
+                *strategy_state,
             );
             if let Some(cached) = cached_result(&metadata) {
                 request_state.borrow_mut().finish(&metadata);
@@ -258,6 +261,7 @@ fn main_component() -> Html {
                 *target,
                 *timeout_seconds,
                 *tolerance_percent,
+                *solver_strategy,
                 cars_len,
             ),
             move |_| {
@@ -314,6 +318,7 @@ fn main_component() -> Html {
             cars.len(),
             *timeout_seconds,
             *tolerance_percent,
+            *solver_strategy,
             *precache_enabled,
             *precache_trigger,
             dataset_generation.get(),
@@ -335,6 +340,7 @@ fn main_component() -> Html {
                 car_count,
                 timeout_secs,
                 tolerance_val,
+                strategy,
                 enabled,
                 _trigger,
                 dataset_id,
@@ -361,6 +367,7 @@ fn main_component() -> Html {
                             player_count: nr,
                             timeout_secs,
                             tolerance_percent: tolerance_val,
+                            strategy,
                         },
                         context: PrecacheExecutionContext {
                             cache_version,
@@ -409,6 +416,7 @@ fn main_component() -> Html {
                         player_count: nr,
                         timeout_ms,
                         tolerance_percent: *tolerance_percent,
+                        strategy: *solver_strategy,
                     };
                     c.borrow().contains_key(&cache_key(&metadata))
                 })
@@ -424,6 +432,7 @@ fn main_component() -> Html {
         let dataset_generation = dataset_generation.clone();
         let timeout_seconds = timeout_seconds.clone();
         let tolerance_percent = tolerance_percent.clone();
+        let chart_strategy = solver_strategy.clone();
         use_effect_with(
             (
                 *lap_count,
@@ -432,6 +441,7 @@ fn main_component() -> Html {
                 dataset_generation.get(),
                 *timeout_seconds,
                 *tolerance_percent,
+                *solver_strategy,
                 *cache_version,
             ),
             move |_| {
@@ -445,6 +455,7 @@ fn main_component() -> Html {
                         player_count: *player_handle,
                         timeout_ms: *timeout_seconds * 1000.0,
                         tolerance_percent: *tolerance_percent,
+                        strategy: *chart_strategy,
                     },
                 );
                 || ()
@@ -1090,6 +1101,66 @@ fn main_component() -> Html {
                                 { "Enable Pre-caching" }
                             </label>
                         </div>
+
+                        <fieldset class="strategy-setting">
+                            <legend>{ "Solver strategy" }</legend>
+                            <div class="strategy-selector" role="radiogroup" aria-label="Solver strategy">
+                                <label class={classes!("strategy-option", (*solver_strategy == SolverStrategy::Bounded).then_some("selected"))}>
+                                    <input
+                                        type="radio"
+                                        name="solver-strategy"
+                                        value="bounded"
+                                        checked={*solver_strategy == SolverStrategy::Bounded}
+                                        onchange={
+                                            let solver_strategy = solver_strategy.clone();
+                                            let request_state = request_state.clone();
+                                            let active_calculation = active_calculation.clone();
+                                            let results = results.clone();
+                                            let error_message = error_message.clone();
+                                            let is_calculating = is_calculating.clone();
+                                            Callback::from(move |_| {
+                                                if let Some(handle) = active_calculation.borrow_mut().take() {
+                                                    handle.abort();
+                                                }
+                                                request_state.borrow_mut().cancel();
+                                                results.set(None);
+                                                error_message.set(None);
+                                                is_calculating.set(false);
+                                                solver_strategy.set(SolverStrategy::Bounded);
+                                            })
+                                        }
+                                    />
+                                    <span><strong>{ "Bounded" }</strong><small>{ "Recommended · validity checked" }</small></span>
+                                </label>
+                                <label class={classes!("strategy-option", (*solver_strategy == SolverStrategy::Legacy).then_some("selected"))}>
+                                    <input
+                                        type="radio"
+                                        name="solver-strategy"
+                                        value="legacy"
+                                        checked={*solver_strategy == SolverStrategy::Legacy}
+                                        onchange={
+                                            let solver_strategy = solver_strategy.clone();
+                                            let request_state = request_state.clone();
+                                            let active_calculation = active_calculation.clone();
+                                            let results = results.clone();
+                                            let error_message = error_message.clone();
+                                            let is_calculating = is_calculating.clone();
+                                            Callback::from(move |_| {
+                                                if let Some(handle) = active_calculation.borrow_mut().take() {
+                                                    handle.abort();
+                                                }
+                                                request_state.borrow_mut().cancel();
+                                                results.set(None);
+                                                error_message.set(None);
+                                                is_calculating.set(false);
+                                                solver_strategy.set(SolverStrategy::Legacy);
+                                            })
+                                        }
+                                    />
+                                    <span><strong>{ "Legacy" }</strong><small>{ "Experimental · historical behavior" }</small></span>
+                                </label>
+                            </div>
+                        </fieldset>
 
                         <div class="form-row">
                             <div class="form-group">

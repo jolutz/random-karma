@@ -5,7 +5,7 @@ use crate::utils::{base_target_step, spread_indices};
 use futures::future::{AbortHandle, Abortable};
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use random_karma::worker_agent::{KarmaArgs, KarmaResult, KarmaTask, RequestMetadata};
-use random_karma::{get_target_range_for_subset, Car};
+use random_karma::{get_target_range_for_subset, Car, SolverStrategy};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use yew::UseStateHandle;
@@ -20,6 +20,7 @@ pub struct PrecacheConfig {
     pub player_count: usize,
     pub timeout_secs: f64,
     pub tolerance_percent: f64,
+    pub strategy: SolverStrategy,
 }
 
 #[derive(Clone)]
@@ -129,6 +130,7 @@ pub fn run(job: PrecacheJob) {
         player_count,
         timeout_secs,
         tolerance_percent,
+        strategy,
     } = config;
     let (min, max) = get_target_range_for_subset(&cars, lap_count);
     let step = base_target_step(min, max);
@@ -162,6 +164,7 @@ pub fn run(job: PrecacheJob) {
                         player_count,
                         timeout_ms: timeout_secs * 1000.0,
                         tolerance_percent,
+                        strategy,
                     };
                     if CACHE_STORE.with(|cache| cache.borrow().contains_key(&cache_key(&metadata)))
                     {

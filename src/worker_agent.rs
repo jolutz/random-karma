@@ -1,6 +1,6 @@
 //! Web Worker agent for offloading karma calculations to background threads.
 
-use crate::{compute_jaccard_similarity, perform_multiple_runs, Car};
+use crate::{compute_jaccard_similarity, perform_multiple_runs_with_strategy, Car, SolverStrategy};
 use futures::sink::SinkExt;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,7 @@ pub struct RequestMetadata {
     pub player_count: usize,
     pub timeout_ms: f64,
     pub tolerance_percent: f64,
+    pub strategy: SolverStrategy,
 }
 
 /// Arguments for karma calculation tasks sent to workers.
@@ -51,7 +52,8 @@ pub async fn KarmaTask(mut scope: ReactorScope<KarmaArgs, KarmaResult>) {
     while let Some(args) = scope.next().await {
         let metadata = args.metadata.clone();
         let res = (|| {
-            let sets = perform_multiple_runs(
+            let sets = perform_multiple_runs_with_strategy(
+                metadata.strategy,
                 &args.cars,
                 metadata.target,
                 metadata.lap_count,

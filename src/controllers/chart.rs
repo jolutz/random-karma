@@ -1,5 +1,6 @@
 use crate::cache::CACHE_STORE;
 use crate::chart::{add_similarity_data, init_similarity_chart};
+use random_karma::SolverStrategy;
 
 #[derive(Clone, Copy)]
 pub struct ChartCacheFilter {
@@ -8,6 +9,7 @@ pub struct ChartCacheFilter {
     pub player_count: usize,
     pub timeout_ms: f64,
     pub tolerance_percent: f64,
+    pub strategy: SolverStrategy,
 }
 
 /// Initializes the chart and replays a sorted, settings-specific cache snapshot.
@@ -33,6 +35,7 @@ pub fn initialize_and_replay(min: u32, max: u32, filter: ChartCacheFilter) {
                     && key.player_count == filter.player_count
                     && key.timeout_ms_bits == filter.timeout_ms.to_bits()
                     && key.tolerance_percent_bits == filter.tolerance_percent.to_bits()
+                    && key.strategy == filter.strategy
             })
             .map(|(key, (_, similarity, _))| (key.target_ms, *similarity))
             .collect()

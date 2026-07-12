@@ -353,7 +353,7 @@ fn is_timeout_exceeded(start_time: f64, max_runtime_ms: f64) -> bool {
 ///
 /// The legacy strategy remains available so a future solver can be introduced
 /// and rolled back without restoring deleted code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, serde::Deserialize, Eq, Hash, PartialEq, serde::Serialize)]
 pub enum SolverStrategy {
     Legacy,
     Bounded,
@@ -1490,6 +1490,27 @@ pub fn perform_multiple_runs(
     timeout_ms: f64,
     tolerance_percent: f64,
 ) -> Result<Vec<Vec<CarIndex>>, SubsetError> {
+    perform_multiple_runs_with_strategy(
+        DEFAULT_SOLVER_STRATEGY,
+        global_cars,
+        target,
+        lap_count,
+        player_count,
+        timeout_ms,
+        tolerance_percent,
+    )
+}
+
+/// Performs multiple runs using the explicitly selected solver implementation.
+pub fn perform_multiple_runs_with_strategy(
+    strategy: SolverStrategy,
+    global_cars: &[Car],
+    target: u32,
+    lap_count: usize,
+    player_count: usize,
+    timeout_ms: f64,
+    tolerance_percent: f64,
+) -> Result<Vec<Vec<CarIndex>>, SubsetError> {
     if !timeout_ms.is_finite() || timeout_ms < 0.0 {
         return Err(SubsetError::InvalidTimeout(timeout_ms));
     }
@@ -1556,7 +1577,7 @@ pub fn perform_multiple_runs(
             }
 
             let mut rng = rand::rng();
-            let attempt = match match DEFAULT_SOLVER_STRATEGY {
+            let attempt = match match strategy {
                 SolverStrategy::Legacy => legacy_find_approximate_subset_from_candidates(
                     global_cars,
                     target,
@@ -1594,7 +1615,7 @@ pub fn perform_multiple_runs(
                 }
             };
 
-            if DEFAULT_SOLVER_STRATEGY == SolverStrategy::Legacy {
+            if strategy == SolverStrategy::Legacy {
                 let subset_sum = calculate_subset_sum(global_cars, &attempt);
                 let accuracy = accuracy_percent(subset_sum, target);
                 if !within_tolerance(accuracy, tolerance_percent) {
@@ -2405,89 +2426,207 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "deterministic chart-range diagnostic; run with --ignored --nocapture"]
+    #[ignore = "bounded chart-range strategy comparison; run with --ignored --nocapture"]
     fn bundled_cars_chart_range_diagnostic() {
         use std::io::Write;
+        use std::time::Duration;
 
         const TARGET_SAMPLES: usize = 10;
-        const MULTI_RUN_TIMEOUT_MS: f64 = 1_000.0;
+        const TIMEOUT_MS: f64 = 1_000.0;
+        const LAP_COUNT: usize = 25;
+        const PLAYER_COUNT: usize = 32;
+        const TOLERANCE: f64 = 0.5;
+
+        #[derive(Debug)]
+        struct TargetMetrics {
+            target: u32,
+            jaccard: f64,
+            reused: usize,
+            elapsed: Duration,
+        }
+
+        #[derive(Default)]
+        struct StrategyMetrics {
+            successful: Vec<TargetMetrics>,
+            invalid_outputs: usize,
+            elapsed: Duration,
+        }
+
+        fn median(values: &mut [f64]) -> f64 {
+            values.sort_by(f64::total_cmp);
+            let middle = values.len() / 2;
+            if values.len().is_multiple_of(2) {
+                (values[middle - 1] + values[middle]) / 2.0
+            } else {
+                values[middle]
+            }
+        }
+
+        fn report(name: &str, metrics: &StrategyMetrics) {
+            let count = metrics.successful.len();
+            let total_reused: usize = metrics.successful.iter().map(|entry| entry.reused).sum();
+            let average_reused = total_reused as f64 / count.max(1) as f64;
+            let average_jaccard = metrics
+                .successful
+                .iter()
+                .map(|entry| entry.jaccard)
+                .sum::<f64>()
+                / count.max(1) as f64;
+            let mut similarities: Vec<_> = metrics
+                .successful
+                .iter()
+                .map(|entry| entry.jaccard)
+                .collect();
+            let median_jaccard = if similarities.is_empty() {
+                f64::NAN
+            } else {
+                median(&mut similarities)
+            };
+            let successful_elapsed: Duration =
+                metrics.successful.iter().map(|entry| entry.elapsed).sum();
+            println!(
+                "{name}: successful_targets={count}/{TARGET_SAMPLES}, average_jaccard={average_jaccard:.6}, median_jaccard={median_jaccard:.6}, total_reused={total_reused}, average_reused={average_reused:.2}, successful_elapsed={successful_elapsed:?}, total_elapsed={:?}, invalid_outputs={}",
+                metrics.elapsed, metrics.invalid_outputs,
+            );
+
+            assert_eq!(
+                total_reused,
+                metrics
+                    .successful
+                    .iter()
+                    .map(|entry| entry.reused)
+                    .sum::<usize>(),
+                "reported reuse total must equal its target components"
+            );
+            if count > 0 {
+                assert!((average_reused * count as f64 - total_reused as f64).abs() < 1e-9);
+                assert!((0.0..=1.0).contains(&average_jaccard));
+                assert!((0.0..=1.0).contains(&median_jaccard));
+            }
+        }
 
         let cars = read_cars_from_csv_string(include_str!("cars.csv")).unwrap();
-        let (min_target, max_target) = get_target_range_for_subset(&cars, UI_LAP_COUNT);
-        let started = Instant::now();
-        let mut bounded_valid = 0;
-        let mut legacy_valid = 0;
-        let mut multi_success = 0;
+        let (min_target, max_target) = get_target_range_for_subset(&cars, LAP_COUNT);
+        let targets: Vec<u32> = (0..TARGET_SAMPLES)
+            .map(|sample| {
+                (u64::from(min_target)
+                    + (u64::from(max_target) - u64::from(min_target)) * sample as u64
+                        / (TARGET_SAMPLES - 1) as u64) as u32
+            })
+            .collect();
+        let mut bounded = StrategyMetrics::default();
+        let mut legacy = StrategyMetrics::default();
 
-        for sample in 0..TARGET_SAMPLES {
-            let target = (u64::from(min_target)
-                + (u64::from(max_target) - u64::from(min_target)) * sample as u64
-                    / (TARGET_SAMPLES - 1) as u64) as u32;
-            let accepted = accepted_sum_interval(target, defaults::TOLERANCE_PERCENT);
+        for (sample, &target) in targets.iter().enumerate() {
+            print!(
+                "chart-range {}/{TARGET_SAMPLES}: target={target}",
+                sample + 1
+            );
+            std::io::stdout().flush().unwrap();
 
-            let run_single = |strategy, seed| {
-                let single_started = Instant::now();
-                let mut rng = StdRng::seed_from_u64(seed);
-                let result = find_approximate_subset_with_strategy_and_rng(
+            for (name, strategy, metrics) in [
+                ("bounded", SolverStrategy::Bounded, &mut bounded),
+                ("legacy", SolverStrategy::Legacy, &mut legacy),
+            ] {
+                let started = Instant::now();
+                let result = perform_multiple_runs_with_strategy(
                     strategy,
                     &cars,
                     target,
-                    UI_LAP_COUNT,
-                    &HashSet::new(),
-                    defaults::TOLERANCE_PERCENT,
-                    &mut rng,
+                    LAP_COUNT,
+                    PLAYER_COUNT,
+                    TIMEOUT_MS,
+                    TOLERANCE,
                 );
-                let valid = result.as_ref().is_ok_and(|subset| {
-                    validate_bounded_subset(&cars, subset, UI_LAP_COUNT, target, accepted).is_ok()
+                let elapsed = started.elapsed();
+                metrics.elapsed += elapsed;
+                let accepted = accepted_sum_interval(target, TOLERANCE);
+                let structurally_valid = result.as_ref().is_ok_and(|subsets| {
+                    subsets.len() == PLAYER_COUNT
+                        && subsets.iter().all(|subset| {
+                            validate_bounded_subset(&cars, subset, LAP_COUNT, target, accepted)
+                                .is_ok()
+                        })
                 });
-                (
-                    valid,
-                    result.err().map(|error| error.to_string()),
-                    single_started.elapsed(),
-                )
-            };
+                if result.is_ok() && !structurally_valid {
+                    metrics.invalid_outputs += 1;
+                }
 
-            let (bounded_ok, bounded_error, bounded_elapsed) =
-                run_single(SolverStrategy::Bounded, 0xB0_0000 + sample as u64);
-            let (legacy_ok, legacy_error, legacy_elapsed) =
-                run_single(SolverStrategy::Legacy, 0x1E_0000 + sample as u64);
-            bounded_valid += usize::from(bounded_ok);
-            legacy_valid += usize::from(legacy_ok);
-
-            let multi_started = Instant::now();
-            let multi_result = perform_multiple_runs(
-                &cars,
-                target,
-                UI_LAP_COUNT,
-                UI_PLAYER_COUNT,
-                MULTI_RUN_TIMEOUT_MS,
-                defaults::TOLERANCE_PERCENT,
-            );
-            let multi_elapsed = multi_started.elapsed();
-            let multi_ok = multi_result.as_ref().is_ok_and(|subsets| {
-                subsets.len() == UI_PLAYER_COUNT
-                    && subsets.iter().all(|subset| {
-                        validate_bounded_subset(&cars, subset, UI_LAP_COUNT, target, accepted)
-                            .is_ok()
-                    })
-            });
-            multi_success += usize::from(multi_ok);
-            let multi_detail = match &multi_result {
-                Ok(subsets) => format!("{} subsets", subsets.len()),
-                Err(error) => error.to_string(),
-            };
-
-            println!(
-                "chart-range {}/{TARGET_SAMPLES}: target={target}, bounded_valid={bounded_ok} ({bounded_elapsed:?}, {bounded_error:?}), legacy_valid={legacy_ok} ({legacy_elapsed:?}, {legacy_error:?}), multi_valid={multi_ok} ({multi_elapsed:?}, {multi_detail})",
-                sample + 1,
-            );
+                if structurally_valid {
+                    let subsets = result.unwrap();
+                    let total_selections: usize = subsets.iter().map(Vec::len).sum();
+                    let distinct = subsets
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .collect::<HashSet<_>>()
+                        .len();
+                    let reused = total_selections - distinct;
+                    let jaccard = compute_jaccard_similarity(&subsets).unwrap();
+                    assert_eq!(total_selections, LAP_COUNT * PLAYER_COUNT);
+                    assert_eq!(reused + distinct, total_selections);
+                    metrics.successful.push(TargetMetrics {
+                        target,
+                        jaccard,
+                        reused,
+                        elapsed,
+                    });
+                    print!(", {name}=ok({elapsed:?}, jaccard={jaccard:.4}, reused={reused})");
+                } else {
+                    print!(", {name}=failed({elapsed:?})");
+                }
+                std::io::stdout().flush().unwrap();
+            }
+            println!();
             std::io::stdout().flush().unwrap();
         }
 
-        println!(
-            "chart-range summary: range={min_target}..={max_target}, samples={TARGET_SAMPLES}, bounded_valid={bounded_valid}/{TARGET_SAMPLES}, legacy_valid={legacy_valid}/{TARGET_SAMPLES}, multi_success={multi_success}/{TARGET_SAMPLES}, elapsed={:?}",
-            started.elapsed(),
+        report("bounded", &bounded);
+        report("legacy", &legacy);
+        assert_eq!(
+            bounded.invalid_outputs, 0,
+            "bounded returned an invalid output"
         );
+
+        let matched: Vec<_> = bounded
+            .successful
+            .iter()
+            .filter_map(|bounded_target| {
+                legacy
+                    .successful
+                    .iter()
+                    .find(|legacy_target| legacy_target.target == bounded_target.target)
+                    .map(|legacy_target| (bounded_target, legacy_target))
+            })
+            .collect();
+        let divisor = matched.len().max(1) as f64;
+        let jaccard_delta = matched
+            .iter()
+            .map(|(bounded_target, legacy_target)| bounded_target.jaccard - legacy_target.jaccard)
+            .sum::<f64>()
+            / divisor;
+        let reused_delta = matched
+            .iter()
+            .map(|(bounded_target, legacy_target)| {
+                bounded_target.reused as f64 - legacy_target.reused as f64
+            })
+            .sum::<f64>()
+            / divisor;
+        let elapsed_delta_ms = matched
+            .iter()
+            .map(|(bounded_target, legacy_target)| {
+                bounded_target.elapsed.as_secs_f64() - legacy_target.elapsed.as_secs_f64()
+            })
+            .sum::<f64>()
+            * 1_000.0
+            / divisor;
+        println!(
+            "matched-success: targets={}, average_direct_delta(bounded-legacy): jaccard={jaccard_delta:.6}, reused={reused_delta:.2}, elapsed_ms={elapsed_delta_ms:.3}",
+            matched.len(),
+        );
+        assert!(matched.iter().all(|(bounded_target, legacy_target)| {
+            bounded_target.target == legacy_target.target
+        }));
         std::io::stdout().flush().unwrap();
     }
 
