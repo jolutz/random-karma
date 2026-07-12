@@ -65,7 +65,10 @@ impl fmt::Display for SubsetError {
             SubsetError::TargetUnreachable { target, current_sum, min_possible, max_possible } => write!(
                 f,
                 "Target {} is unreachable. Current sum: {}. Possible range: [{} to {}]",
-                target, current_sum, current_sum + min_possible, current_sum + max_possible
+                target,
+                current_sum,
+                u64::from(*current_sum) + u64::from(*min_possible),
+                u64::from(*current_sum) + u64::from(*max_possible)
             ),
             SubsetError::NoPreviouslySelectedAvailable => write!(
                 f,
@@ -162,7 +165,7 @@ fn handle_last_number(
 
     // Binary search to find closest element to needed time
     let best_match_idx = find_closest_time(cars, candidates_for_current_selection, needed);
-    let best_match_sum = current_sum + get_lap_time(cars, best_match_idx);
+    let best_match_sum = current_sum.saturating_add(get_lap_time(cars, best_match_idx));
 
     // use new helpers
     let accuracy = accuracy_percent(best_match_sum, target);
@@ -174,7 +177,10 @@ fn handle_last_number(
         let mut candidates_copy: Vec<CarIndex> = candidates_for_current_selection.to_vec();
         let (fallback_idx, _) =
             fallback_strategy(cars, &mut candidates_copy, current_sum, target, 1);
-        return (fallback_idx, current_sum + get_lap_time(cars, fallback_idx));
+        return (
+            fallback_idx,
+            current_sum.saturating_add(get_lap_time(cars, fallback_idx)),
+        );
     }
 
     debug!(
@@ -300,7 +306,11 @@ fn try_extend_with_previous(
 /// Helper function to calculate sum of lap times for a subset
 #[inline]
 fn calculate_subset_sum(cars: &[Car], subset: &[CarIndex]) -> u32 {
-    subset.iter().map(|&idx| get_lap_time(cars, idx)).sum()
+    subset
+        .iter()
+        .map(|&idx| get_lap_time(cars, idx))
+        .try_fold(0_u32, u32::checked_add)
+        .unwrap_or(u32::MAX)
 }
 
 /// Helper function to check if we need to abort due to timeout
@@ -432,8 +442,8 @@ fn find_approximate_subset_from_candidates(
                 "Target {} no longer reachable. Current sum: {}, Range: [{}, {}]",
                 target,
                 current_sum,
-                current_sum + min_possible,
-                current_sum + max_possible
+                u64::from(current_sum) + u64::from(min_possible),
+                u64::from(current_sum) + u64::from(max_possible)
             );
 
             // Consider previously selected numbers for this selection only if we haven't already
@@ -460,8 +470,8 @@ fn find_approximate_subset_from_candidates(
                     );
                     debug!(
                         "After adding previously selected numbers, new range: [{}, {}]",
-                        current_sum + new_min,
-                        current_sum + new_max
+                        u64::from(current_sum) + u64::from(new_min),
+                        u64::from(current_sum) + u64::from(new_max)
                     );
 
                     // Check whether the expanded range reaches the tolerance-adjusted target.
@@ -515,7 +525,7 @@ fn find_approximate_subset_from_candidates(
             },
         );
 
-        current_sum += get_lap_time(cars, chosen);
+        current_sum = current_sum.saturating_add(get_lap_time(cars, chosen));
         selected.push(chosen);
         debug!(
             "Added: {}. New sum: {}/{} ({}%)",
@@ -582,8 +592,12 @@ fn select_candidate<R: rand::Rng>(
     let (min_possible_remaining, max_possible_remaining) =
         calculate_min_max_sums(cars, candidates_for_current_selection, remaining_needed - 1);
 
-    let min_valid = target.saturating_sub(current_sum + max_possible_remaining);
-    let max_valid = target.saturating_sub(current_sum + min_possible_remaining);
+    let min_valid = u64::from(target)
+        .saturating_sub(u64::from(current_sum) + u64::from(max_possible_remaining))
+        .min(u64::from(u32::MAX)) as u32;
+    let max_valid = u64::from(target)
+        .saturating_sub(u64::from(current_sum) + u64::from(min_possible_remaining))
+        .min(u64::from(u32::MAX)) as u32;
 
     debug!(
         "Valid range for next number: [{}, {}]",
@@ -640,17 +654,15 @@ fn calculate_min_max_sums(cars: &[Car], indexes: &[CarIndex], x: usize) -> (u32,
     }
     // For min sum, sum the first x lap times.
     // For max sum, sum the last x lap times.
-    let min_sum: u32 = indexes
-        .iter()
-        .take(x)
-        .map(|&idx| get_lap_time(cars, idx))
-        .sum();
-    let max_sum: u32 = indexes
-        .iter()
-        .rev()
-        .take(x)
-        .map(|&idx| get_lap_time(cars, idx))
-        .sum();
+    let sum = |values: &mut dyn Iterator<Item = CarIndex>| {
+        values
+            .map(|idx| u64::from(get_lap_time(cars, idx)))
+            .try_fold(0_u64, u64::checked_add)
+            .unwrap_or(u64::MAX)
+            .min(u64::from(u32::MAX)) as u32
+    };
+    let min_sum = sum(&mut indexes.iter().copied().take(x));
+    let max_sum = sum(&mut indexes.iter().rev().copied().take(x));
     (min_sum, max_sum)
 }
 
@@ -664,69 +676,117 @@ pub fn get_target_range_for_subset(cars: &[Car], lap_count: usize) -> (u32, u32)
     calculate_min_max_sums(cars, &indexes, lap_count)
 }
 
-pub fn read_cars_from_csv_string(
-    csv_content: &str,
-) -> Result<Vec<Car>, Box<dyn std::error::Error>> {
-    use std::collections::HashSet;
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CsvImportWarningKind {
+    MalformedCsv,
+    EmptyId,
+    MissingLapTime,
+    InvalidLapTime,
+    DuplicateId,
+}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsvImportWarning {
+    /// One-based logical CSV record number.
+    pub row: usize,
+    pub kind: CsvImportWarningKind,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CsvImportReport {
+    pub cars: Vec<Car>,
+    pub warnings: Vec<CsvImportWarning>,
+    pub row_count: usize,
+    pub accepted_count: usize,
+    pub rejected_count: usize,
+}
+
+pub fn read_cars_from_csv_string_detailed(csv_content: &str) -> CsvImportReport {
     let mut cars = Vec::new();
+    let mut warnings = Vec::new();
     let mut seen_ids = HashSet::new();
+    let mut row_count = 0;
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
         .from_reader(csv_content.as_bytes());
 
     for (i, result) in reader.records().enumerate() {
+        let row = i + 1;
+        row_count += 1;
         let record = match result {
-            Ok(rec) => rec,
-            Err(e) => {
-                debug!("Warning: Failed to parse record on line {}: {}", i + 1, e);
+            Ok(record) => record,
+            Err(error) => {
+                warnings.push(CsvImportWarning {
+                    row,
+                    kind: CsvImportWarningKind::MalformedCsv,
+                    message: error.to_string(),
+                });
                 continue;
             }
         };
-
-        // Expect vehicle in column 0, lap_time in column 1
-        let id = match record.get(0) {
-            Some(val) => val.trim().to_string(),
-            None => {
-                debug!("Warning: Missing vehicle ID on line {}", i + 1);
-                continue;
-            }
-        };
-
-        if !seen_ids.insert(id.clone()) {
-            debug!(
-                "Warning: Duplicate ID '{}' found on line {}, skipping",
-                id,
-                i + 1
-            );
+        let id = record.get(0).unwrap_or_default().trim().to_string();
+        if id.is_empty() {
+            warnings.push(CsvImportWarning {
+                row,
+                kind: CsvImportWarningKind::EmptyId,
+                message: "vehicle ID is empty".to_string(),
+            });
             continue;
         }
-
-        let time_str = match record.get(1) {
-            Some(val) => val.trim(),
-            None => {
-                debug!(
-                    "Warning: Missing lap time for ID '{}' on line {}",
-                    id,
-                    i + 1
-                );
-                continue;
-            }
+        let Some(time_str) = record.get(1).map(str::trim) else {
+            warnings.push(CsvImportWarning {
+                row,
+                kind: CsvImportWarningKind::MissingLapTime,
+                message: format!("missing lap time for ID '{id}'"),
+            });
+            continue;
         };
-
         let lap_time = match parse_lap_time(time_str) {
             Ok(time) => time,
-            Err(e) => {
-                debug!("Warning: {} for ID '{}' on line {}", e, id, i + 1);
+            Err(message) => {
+                warnings.push(CsvImportWarning {
+                    row,
+                    kind: CsvImportWarningKind::InvalidLapTime,
+                    message,
+                });
                 continue;
             }
         };
-
+        // Only accepted rows reserve an ID, so an invalid row cannot suppress a later valid one.
+        if !seen_ids.insert(id.clone()) {
+            warnings.push(CsvImportWarning {
+                row,
+                kind: CsvImportWarningKind::DuplicateId,
+                message: format!("duplicate ID '{id}'"),
+            });
+            continue;
+        }
         cars.push(Car { id, lap_time });
     }
 
-    info!("Successfully loaded {} cars from CSV content", cars.len());
-    Ok(cars)
+    let accepted_count = cars.len();
+    CsvImportReport {
+        cars,
+        warnings,
+        row_count,
+        accepted_count,
+        rejected_count: row_count - accepted_count,
+    }
+}
+
+pub fn read_cars_from_csv_string(
+    csv_content: &str,
+) -> Result<Vec<Car>, Box<dyn std::error::Error>> {
+    let report = read_cars_from_csv_string_detailed(csv_content);
+    for warning in &report.warnings {
+        debug!("CSV row {}: {}", warning.row, warning.message);
+    }
+    info!(
+        "Successfully loaded {} cars from CSV content",
+        report.accepted_count
+    );
+    Ok(report.cars)
 }
 
 fn parse_lap_time(time_str: &str) -> Result<u32, String> {
@@ -746,12 +806,11 @@ fn parse_lap_time(time_str: &str) -> Result<u32, String> {
         Err(_) => return Err(format!("Failed to parse minutes part: '{}'", parts[0])),
     };
 
-    // Split the second part by dot (seconds.milliseconds)
+    // Split the second part by dot (seconds with optional milliseconds).
     let sec_parts: Vec<&str> = parts[1].split('.').collect();
-
-    if sec_parts.len() != 2 {
+    if sec_parts.len() > 2 {
         return Err(format!(
-            "Invalid seconds format: '{}', expected SS.mmm",
+            "Invalid seconds format: '{}', expected SS or SS.mmm",
             parts[1]
         ));
     }
@@ -767,9 +826,15 @@ fn parse_lap_time(time_str: &str) -> Result<u32, String> {
         return Err(format!("Seconds must be between 0 and 59, got {}", seconds));
     }
 
-    // Parse milliseconds
-    let milliseconds_str = sec_parts[1].trim();
-    let mut milliseconds = match milliseconds_str.parse::<u32>() {
+    // Parse optional milliseconds; whole-second values default to zero.
+    let milliseconds_str = sec_parts.get(1).copied().unwrap_or("0").trim();
+    if milliseconds_str.is_empty() || milliseconds_str.len() > 3 {
+        return Err(format!(
+            "Milliseconds must contain between 1 and 3 digits, got '{}'",
+            milliseconds_str
+        ));
+    }
+    let mut milliseconds = match milliseconds_str.parse::<u64>() {
         Ok(ms) => ms,
         Err(_) => {
             return Err(format!(
@@ -787,9 +852,13 @@ fn parse_lap_time(time_str: &str) -> Result<u32, String> {
     }
 
     // Convert to total milliseconds
-    let total_ms = minutes * 60 * 1000 + seconds * 1000 + milliseconds;
+    let total_ms = u64::from(minutes)
+        .checked_mul(60_000)
+        .and_then(|value| value.checked_add(u64::from(seconds) * 1_000))
+        .and_then(|value| value.checked_add(milliseconds))
+        .ok_or_else(|| format!("Lap time is too large: '{time_str}'"))?;
 
-    Ok(total_ms)
+    u32::try_from(total_ms).map_err(|_| format!("Lap time is too large: '{time_str}'"))
 }
 
 pub fn format_ms_to_minsecms(ms: u32) -> String {
@@ -1012,7 +1081,9 @@ pub fn perform_multiple_runs(
     for (i, subset) in all_results.iter().enumerate() {
         let subset_sum = calculate_subset_sum(global_cars, subset);
         total_elements += subset.len();
-        total_sum += subset_sum;
+        total_sum = u64::from(total_sum)
+            .saturating_add(u64::from(subset_sum))
+            .min(u64::from(u32::MAX)) as u32;
 
         info!(
             "Run {}: {} numbers, sum = {} ({}% of target)",
@@ -1039,7 +1110,7 @@ pub fn perform_multiple_runs(
         info!(
             "Total sum across all runs: {}/{}",
             total_sum,
-            target * all_results.len() as u32
+            u64::from(target).saturating_mul(all_results.len() as u64)
         );
         info!("Average accuracy: {:.2}%", avg_accuracy);
         info!("Remaining numbers in pool: {}", available_indexes.len());
@@ -1241,6 +1312,85 @@ mod tests {
         assert_eq!(compute_jaccard_similarity(&[vec![], vec![]]).unwrap(), 1.0);
         assert!(compute_jaccard_similarity(&[]).is_err());
         assert!(compute_jaccard_similarity(&[vec![1]]).is_err());
+    }
+
+    #[test]
+    fn detailed_csv_import_reports_malformed_and_missing_fields() {
+        let report =
+            read_cars_from_csv_string_detailed("good,01:02.003\ntoo,many,fields\nmissing-time\n");
+
+        assert_eq!(report.cars, vec![car("good", 62_003)]);
+        assert_eq!(
+            (
+                report.row_count,
+                report.accepted_count,
+                report.rejected_count
+            ),
+            (3, 1, 2)
+        );
+        assert_eq!(report.warnings.len(), 2);
+        assert_eq!(report.warnings[0].kind, CsvImportWarningKind::MalformedCsv);
+        assert_eq!(report.warnings[0].row, 2);
+        assert_eq!(report.warnings[1].kind, CsvImportWarningKind::MalformedCsv);
+    }
+
+    #[test]
+    fn csv_import_supports_quoted_fields_and_legacy_api() {
+        let input = "\"car, one\",\"01:02.3\"\n";
+        let report = read_cars_from_csv_string_detailed(input);
+
+        assert_eq!(report.cars, vec![car("car, one", 62_300)]);
+        assert!(report.warnings.is_empty());
+        assert_eq!(read_cars_from_csv_string(input).unwrap(), report.cars);
+    }
+
+    #[test]
+    fn invalid_duplicate_does_not_reserve_id_and_valid_duplicates_are_rejected() {
+        let report =
+            read_cars_from_csv_string_detailed("same,not-a-time\nsame,00:01.000\nsame,00:02.000\n");
+
+        assert_eq!(report.cars, vec![car("same", 1_000)]);
+        assert_eq!(
+            report.warnings[0].kind,
+            CsvImportWarningKind::InvalidLapTime
+        );
+        assert_eq!(report.warnings[1].kind, CsvImportWarningKind::DuplicateId);
+        assert_eq!((report.accepted_count, report.rejected_count), (1, 2));
+    }
+
+    #[test]
+    fn csv_import_rejects_empty_ids() {
+        let report = read_cars_from_csv_string_detailed(",00:01.000\n   ,00:02.000\n");
+
+        assert!(report.cars.is_empty());
+        assert_eq!(report.rejected_count, 2);
+        assert!(report
+            .warnings
+            .iter()
+            .all(|warning| warning.kind == CsvImportWarningKind::EmptyId));
+    }
+
+    #[test]
+    fn lap_time_parser_rejects_overflow_and_excess_precision() {
+        assert!(parse_lap_time("71583:00.000").is_err());
+        assert!(parse_lap_time("4294967295:00.000").is_err());
+        assert!(parse_lap_time("00:00.0000").is_err());
+        assert_eq!(parse_lap_time("00:00.1").unwrap(), 100);
+    }
+
+    #[test]
+    fn accumulated_subset_and_range_arithmetic_clamps_instead_of_overflowing() {
+        let cars = vec![car("a", u32::MAX), car("b", u32::MAX), car("c", 1)];
+
+        assert_eq!(calculate_subset_sum(&cars, &[0, 1]), u32::MAX);
+        assert_eq!(get_target_range_for_subset(&cars, 2), (u32::MAX, u32::MAX));
+        assert!(!target_is_reachable(
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            u32::MAX,
+            0.0,
+        ));
     }
 }
 

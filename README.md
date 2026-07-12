@@ -78,4 +78,12 @@ cargo check --target wasm32-unknown-unknown --all-targets
 trunk build --release
 ```
 
-`.github/workflows/main.yml` validates pushes and pull requests to `master`; it has no deployment permissions. `.github/workflows/deploy.yml` is a separate workflow that builds and deploys only pushes to `master` (or a manual dispatch). Pull requests never deploy. GitHub Pages must be configured in the repository to use **GitHub Actions** as its source.
+Run the Chromium end-to-end suite with:
+
+```sh
+npm ci
+npx playwright install chromium
+npm run test:e2e
+```
+
+`.github/workflows/main.yml` validates pushes and pull requests to `master`; it has no deployment permissions. `.github/workflows/e2e.yml` builds the application and runs the Playwright suite in Chromium. `.github/workflows/deploy.yml` is a separate workflow that builds and deploys only pushes to `master` (or a manual dispatch). Pull requests never deploy. GitHub Pages must be configured in the repository to use **GitHub Actions** as its source.

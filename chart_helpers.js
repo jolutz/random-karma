@@ -1,315 +1,177 @@
-// Chart.js helper functions for Random Karma visualization
-
-// Configuration constants
+// Chart.js bridge used by the Rust/WASM application.
 const CONFIG = {
 	MAX_RETRY_ATTEMPTS: 20,
 	RETRY_DELAY_MS: 50,
-	CHART_ANIMATION: false,
-	SLIDER_WIDTH_BUFFER: 10,
-
-	// Theme co/lors matching CSS design system
-	COLORS: {
-		primary: '#4361ee',
-		danger: '#f87171',
-		grid: '#e5e7eb',
-		text: '#4b5563',
-		tooltipBg: 'rgba(31, 41, 55, 0.8)',
-		tooltipText: '#fff'
-	},
-
-	// Chart layout settings
-	LAYOUT: {
-		padding: { top: 5, bottom: 5, left: 10, right: 10 },
-		fontSize: {
-			tick: 10,
-			tooltip: 12
-		},
-		maxTicks: 6
-	}
+	FONT: 'Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif',
 };
 
-// Global state
 let chart = null;
 let currentLapCount = null;
 let currentPlayerCount = null;
 let resizeHandler = null;
+let themeWatcher = null;
+let pendingUpdate = 0;
 
-// Utility functions ----------------------------------------------------------
-
-/**
- * Wait for Chart.js to load with retry mechanism
- * @param {Function} cb - Callback to execute when Chart.js is available
- * @param {number} tries - Current retry attempt
- */
-function ready(cb, tries = 0) {
-	if (typeof window.Chart !== "undefined") {
-		cb(window.Chart);
-	} else if (tries < CONFIG.MAX_RETRY_ATTEMPTS) {
-		setTimeout(() => ready(cb, tries + 1), CONFIG.RETRY_DELAY_MS);
-	} else {
-		console.error("Chart.js did not load in time.");
-	}
+function ready(callback, tries = 0) {
+	if (typeof window.Chart !== "undefined") callback(window.Chart);
+	else if (tries < CONFIG.MAX_RETRY_ATTEMPTS) setTimeout(() => ready(callback, tries + 1), CONFIG.RETRY_DELAY_MS);
+	else console.error("Chart.js did not load in time.");
 }
 
-/**
- * Format milliseconds to minute:second format
- * @param {number} ms - Time in milliseconds
- * @returns {string} Formatted time string
- */
-function formatMsToMinSec(ms) {
-	const totalSec = Math.floor(ms / 1000);
-	const m = Math.floor(totalSec / 60);
-	const s = totalSec % 60;
-	return `${m}m ${s}s`;
+function cssColor(name, fallback) {
+	const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+	return value || fallback;
 }
 
-/**
- * Format milliseconds to compact M:SS format for axis labels
- * @param {number} ms - Time in milliseconds
- * @returns {string} Formatted time string
- */
-function formatMsCompact(ms) {
-	const sec = Math.floor(ms / 1000);
-	const m = Math.floor(sec / 60);
-	const s = sec % 60;
-	return `${m}:${s.toString().padStart(2, '0')}`;
-}
-
-/**
- * Synchronize slider width with chart width for visual alignment
- */
-function syncSliderWithChart() {
-	const chartCanvas = document.getElementById('similarityChart');
-	const targetSlider = document.querySelector('.target-slider-container input[type="range"]');
-
-	if (chartCanvas && targetSlider) {
-		const chartWidth = chartCanvas.getBoundingClientRect().width;
-		targetSlider.style.width = `${chartWidth - CONFIG.SLIDER_WIDTH_BUFFER}px`;
-	}
-}
-
-// Chart management functions -------------------------------------------------
-
-/**
- * Create chart configuration object
- * @param {number} min - Minimum x-axis value
- * @param {number} max - Maximum x-axis value
- * @returns {Object} Chart.js configuration
- */
-function createChartConfig(min, max) {
+function theme() {
 	return {
-		type: "line",
-		data: {
-			datasets: [
-				{
-					label: "Jaccard Similarity (%)",
-					backgroundColor: CONFIG.COLORS.primary,
-					borderColor: CONFIG.COLORS.primary,
-					fill: false,
-					tension: 0.35,
-					pointRadius: 3,
-					pointHoverRadius: 6,
-					data: [],
-				},
-			],
-		},
-		options: {
-			animation: CONFIG.CHART_ANIMATION,
-			spanGaps: true,
-			responsive: true,
-			maintainAspectRatio: false,
-			onClick: (evt) => {
-				const points = chart.getElementsAtEventForMode(evt, 'point', { intersect: true }, false);
-				if (points.length) {
-					const firstPoint = points[0];
-					const targetTime = chart.data.datasets[firstPoint.datasetIndex].data[firstPoint.index].x;
+		primary: cssColor('--primary', '#6d5dfc'),
+		danger: cssColor('--danger', '#dc4c64'),
+		grid: cssColor('--grid', 'rgba(80,94,121,.13)'),
+		text: cssColor('--text-muted', '#667085'),
+		surface: cssColor('--surface-solid', '#fff'),
+		tooltip: cssColor('--text', '#172033'),
+	};
+}
 
-					const targetSlider = document.querySelector('.target-slider-container input[type="range"]');
-					if (targetSlider) {
-						targetSlider.value = targetTime;
-						// Dispatch an event to notify of the change
-						targetSlider.dispatchEvent(new Event('input', { bubbles: true }));
-					}
+function formatMsToMinSec(ms) {
+	const totalSeconds = Math.floor(ms / 1000);
+	return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
+}
+
+function formatMsCompact(ms) {
+	const seconds = Math.floor(ms / 1000);
+	return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+function scheduleUpdate() {
+	if (!chart || pendingUpdate) return;
+	pendingUpdate = requestAnimationFrame(() => {
+		pendingUpdate = 0;
+		chart?.update('none');
+	});
+}
+
+function syncSliderWithChart() {
+	const canvas = document.getElementById('similarityChart');
+	const slider = document.querySelector('.target-slider-container input[type="range"]');
+	if (canvas && slider) slider.style.width = `${Math.max(0, canvas.getBoundingClientRect().width)}px`;
+}
+
+function applyTheme() {
+	if (!chart) return;
+	const colors = theme();
+	const main = chart.data.datasets[0];
+	main.borderColor = colors.primary;
+	main.backgroundColor = colors.primary;
+	main.pointBackgroundColor = colors.surface;
+	const failed = chart.data.datasets.find(dataset => dataset.label === 'Failed');
+	if (failed) failed.backgroundColor = failed.borderColor = colors.danger;
+	chart.options.scales.x.grid.color = colors.grid;
+	chart.options.scales.x.ticks.color = colors.text;
+	chart.options.scales.y.grid.color = colors.grid;
+	chart.options.plugins.tooltip.backgroundColor = colors.tooltip;
+	scheduleUpdate();
+}
+
+function createChartConfig(min, max) {
+	const colors = theme();
+	return {
+		type: 'line',
+		data: { datasets: [{
+			label: 'Jaccard similarity', data: [], borderColor: colors.primary,
+			backgroundColor: colors.primary, pointBackgroundColor: colors.surface,
+			pointBorderColor: colors.primary, borderWidth: 2.5, pointBorderWidth: 2,
+			pointRadius: 2.5, pointHoverRadius: 6, tension: .32, fill: false,
+		}] },
+		options: {
+			animation: false, responsive: true, maintainAspectRatio: false, normalized: true,
+			parsing: false, spanGaps: true, interaction: { mode: 'nearest', intersect: false },
+			onClick: event => {
+				const points = chart?.getElementsAtEventForMode(event, 'nearest', { intersect: true }, false) || [];
+				if (!points.length) return;
+				const point = points[0];
+				const target = chart.data.datasets[point.datasetIndex].data[point.index]?.x;
+				const slider = document.querySelector('.target-slider-container input[type="range"]');
+				if (slider && target != null) {
+					slider.value = target;
+					slider.dispatchEvent(new Event('input', { bubbles: true }));
 				}
 			},
-			layout: {
-				padding: CONFIG.LAYOUT.padding
-			},
+			layout: { padding: { top: 30, right: 10, bottom: 4, left: 8 } },
 			scales: {
 				x: {
-					type: "linear",
-					min,
-					max,
-					title: { display: false },
-					grid: {
-						display: true,
-						drawBorder: false,
-						color: CONFIG.COLORS.grid
-					},
-					ticks: {
-						color: CONFIG.COLORS.text,
-						font: {
-							size: CONFIG.LAYOUT.fontSize.tick,
-							family: "'Inter', sans-serif"
-						},
-						maxRotation: 0,
-						autoSkip: true,
-						maxTicksLimit: CONFIG.LAYOUT.maxTicks,
-						padding: 0,
-						callback: (value) => formatMsCompact(value)
-					},
+					type: 'linear', min, max, border: { display: false },
+					grid: { color: colors.grid, tickLength: 0 },
+					ticks: { color: colors.text, font: { family: CONFIG.FONT, size: 11 }, maxRotation: 0, maxTicksLimit: 7, padding: 10, callback: formatMsCompact },
 				},
 				y: {
-					min: 0,
-					max: 100,
-					display: false,
-					grid: {
-						color: CONFIG.COLORS.grid,
-						drawBorder: false
-					},
+					min: 0, max: 100, border: { display: false }, grid: { color: colors.grid, tickLength: 0 },
+					ticks: { color: colors.text, font: { family: CONFIG.FONT, size: 10 }, maxTicksLimit: 5, padding: 8, callback: value => `${value}%` },
 				},
 			},
 			plugins: {
 				legend: { display: false },
 				tooltip: {
-					backgroundColor: CONFIG.COLORS.tooltipBg,
-					titleColor: CONFIG.COLORS.tooltipText,
-					bodyColor: CONFIG.COLORS.tooltipText,
-					titleFont: { family: "'Inter', sans-serif" },
-					bodyFont: { family: "'Inter', sans-serif" },
-					cornerRadius: 6,
-					padding: 10,
-					callbacks: {
-						title: (context) => formatMsToMinSec(context[0].parsed.x),
-						label: (context) => `${context.dataset.label}: ${context.parsed.y.toFixed(1)}%`
-					}
-				}
-			},
-			elements: {
-				line: { borderWidth: 2 },
-				point: { backgroundColor: "#fff", borderWidth: 2 },
+					backgroundColor: colors.tooltip, titleColor: colors.surface, bodyColor: colors.surface,
+					displayColors: false, cornerRadius: 10, padding: 12, caretSize: 6,
+					titleFont: { family: CONFIG.FONT, weight: '600' }, bodyFont: { family: CONFIG.FONT },
+					callbacks: { title: items => formatMsToMinSec(items[0].parsed.x), label: item => `Similarity  ${item.parsed.y.toFixed(1)}%` },
+				},
 			},
 		},
 	};
 }
 
-/**
- * Setup resize event handler
- */
-function setupResizeHandler() {
-	if (resizeHandler) {
-		window.removeEventListener('resize', resizeHandler);
+function setupObservers() {
+	if (resizeHandler) window.removeEventListener('resize', resizeHandler);
+	resizeHandler = () => requestAnimationFrame(syncSliderWithChart);
+	window.addEventListener('resize', resizeHandler, { passive: true });
+	if (!themeWatcher && window.matchMedia) {
+		themeWatcher = window.matchMedia('(prefers-color-scheme: dark)');
+		themeWatcher.addEventListener?.('change', applyTheme);
 	}
-
-	resizeHandler = () => {
-		requestAnimationFrame(() => {
-			syncSliderWithChart();
-		});
-	};
-
-	window.addEventListener('resize', resizeHandler);
 }
 
-// Exported functions ---------------------------------------------------------
-
-/**
- * Initialize the similarity chart
- * @param {number} min - Minimum target value
- * @param {number} max - Maximum target value
- * @param {number} lapCount - Current lap count
- * @param {number} playerCount - Current player count
- */
 export function initSimilarityChart(min, max, lapCount, playerCount) {
-	ready((Chart) => {
-		// Clean up existing chart
-		if (chart) {
-			chart.destroy();
-		}
-
-		// Update current parameters
+	ready(Chart => {
+		if (pendingUpdate) cancelAnimationFrame(pendingUpdate);
+		pendingUpdate = 0;
+		chart?.destroy();
+		const canvas = document.getElementById('similarityChart');
+		if (!canvas) return;
 		currentLapCount = lapCount;
 		currentPlayerCount = playerCount;
-
-		// Get canvas context
-		const ctx = document.getElementById("similarityChart").getContext("2d");
-
-		// Create new chart
-		chart = new Chart(ctx, createChartConfig(min, max));
-
-		// Setup slider synchronization
-		setTimeout(() => {
-			syncSliderWithChart();
-		}, 100);
-
-		setupResizeHandler();
+		chart = new Chart(canvas.getContext('2d'), createChartConfig(min, max));
+		requestAnimationFrame(syncSliderWithChart);
+		setupObservers();
 	});
 }
 
-/**
- * Add or update a similarity data point
- * @param {number} target - Target value
- * @param {number} similarity - Similarity percentage (0-100)
- * @param {number} lapCount - Lap count for this data point
- * @param {number} playerCount - Player count for this data point
- */
 export function addSimilarityData(target, similarity, lapCount, playerCount) {
-	if (!chart || lapCount !== currentLapCount || playerCount !== currentPlayerCount) {
-		return;
-	}
-
+	if (!chart || lapCount !== currentLapCount || playerCount !== currentPlayerCount) return;
 	const data = chart.data.datasets[0].data;
-
-	// Binary search to maintain sorted order
-	let lo = 0, hi = data.length;
-	while (lo < hi) {
-		const mid = (lo + hi) >> 1;
-		if (data[mid].x < target) {
-			lo = mid + 1;
-		} else {
-			hi = mid;
-		}
+	let low = 0, high = data.length;
+	while (low < high) {
+		const middle = (low + high) >> 1;
+		if (data[middle].x < target) low = middle + 1;
+		else high = middle;
 	}
-
-	// Update existing or insert new
-	if (data[lo]?.x === target) {
-		data[lo].y = similarity;
-	} else {
-		data.splice(lo, 0, { x: target, y: similarity });
-	}
-
-	chart.update({ animation: false });
+	if (data[low]?.x === target) data[low].y = similarity;
+	else data.splice(low, 0, { x: target, y: similarity });
+	scheduleUpdate();
 }
 
-/**
- * Mark a target that failed to compute with a red marker
- * @param {number} target - Target value that failed
- * @param {number} lapCount - Lap count for this failure
- * @param {number} playerCount - Player count for this failure
- */
 export function chartAddFailedTargetMarker(target, lapCount, playerCount) {
-	if (!chart || lapCount !== currentLapCount || playerCount !== currentPlayerCount) {
-		return;
+	if (!chart || lapCount !== currentLapCount || playerCount !== currentPlayerCount) return;
+	let failed = chart.data.datasets.find(dataset => dataset.label === 'Failed');
+	if (!failed) {
+		const colors = theme();
+		failed = { label: 'Failed', type: 'scatter', data: [], backgroundColor: colors.danger, borderColor: colors.danger, pointStyle: 'crossRot', pointRadius: 7, pointHoverRadius: 9 };
+		chart.data.datasets.push(failed);
 	}
-
-	// Find or create failed dataset
-	let failedDs = chart.data.datasets.find(d => d.label === "Failed");
-	if (!failedDs) {
-		failedDs = {
-			label: "Failed",
-			type: "scatter",
-			backgroundColor: CONFIG.COLORS.danger,
-			borderColor: CONFIG.COLORS.danger,
-			pointStyle: "crossRot",
-			pointRadius: 8,
-			pointHoverRadius: 10,
-			data: [],
-		};
-		chart.data.datasets.push(failedDs);
-	}
-
-	// Add marker if not already present
-	if (!failedDs.data.some(p => p.x === target)) {
-		failedDs.data.push({ x: target, y: 0 });
-		chart.update({ animation: false });
+	if (!failed.data.some(point => point.x === target)) {
+		failed.data.push({ x: target, y: 0 });
+		scheduleUpdate();
 	}
 }

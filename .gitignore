@@ -3,3 +3,8 @@
 
 # Trunk build output
 /dist/
+
+# Playwright / Node artifacts
+/node_modules/
+/test-results/
+/playwright-report/

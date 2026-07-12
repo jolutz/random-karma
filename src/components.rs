@@ -55,14 +55,14 @@ pub struct ResultsWrapperProps {
 /// virtualization is both simpler and cheaper.
 #[function_component(ResultsWrapper)]
 pub fn results_wrapper(props: &ResultsWrapperProps) -> Html {
-    const ROW_HEIGHT: f64 = 38.0;
+    const ROW_HEIGHT: f64 = 44.0;
     const VIEWPORT_HEIGHT: f64 = 600.0;
     const OVERSCAN_ROWS: usize = 10;
 
     if props.all_results.is_empty() {
         return html! {
-            <div class="results">
-                <p class="no-results-message">{ "No results to display" }</p>
+            <div class="results" role="status">
+                <p class="no-results-message">{ "No matching selections for this target" }</p>
             </div>
         };
     }
@@ -89,18 +89,24 @@ pub fn results_wrapper(props: &ResultsWrapperProps) -> Html {
 
     html! {
         <div class="results">
-            <div class="similarity-status">
-                { format!("Jaccard Similarity: {:.2}%", props.similarity * 100.0) }
+            <div class="results-overview">
+                <div class="similarity-status">
+                    { format!("Jaccard similarity · {:.2}%", props.similarity * 100.0) }
+                </div>
+                <span class="results-count">{ format!("{} selections", total_rows) }</span>
             </div>
             <div class="result-sets">
-                <h3>{ "All Car Selections" }</h3>
-                <div class="big-car-table-container" onscroll={on_scroll}>
+                <div class="result-sets-header">
+                    <h3>{ "Car selections" }</h3>
+                    <span>{ format!("Target · {}", format_ms_to_minsecms(props.calculated_target)) }</span>
+                </div>
+                <div class="big-car-table-container" onscroll={on_scroll} tabindex="0" aria-label="Car selection results">
                     <table class="big-car-table">
                         <thead>
                             <tr>
                                 <th class="sticky-col">{ "Set #" }</th>
                                 <th>{ "Total Time" }</th>
-                                <th>{ format!("% Off Target ({})", format_ms_to_minsecms(props.calculated_target)) }</th>
+                                <th>{ "% Off Target" }</th>
                                 { for (0..subset_size).map(|index| html! { <th>{ format!("Car {}", index + 1) }</th> }) }
                             </tr>
                         </thead>
