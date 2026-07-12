@@ -364,6 +364,7 @@ pub const DEFAULT_SOLVER_STRATEGY: SolverStrategy = SolverStrategy::Bounded;
 
 const BOUNDED_NODE_LIMIT: usize = 500_000;
 const BOUNDED_RANDOM_ATTEMPTS: usize = 512;
+const BOUNDED_UNUSED_PHASE_ATTEMPTS: usize = 8;
 
 const EXACT_POOL_LIMIT: usize = 20;
 const DEADLINE_CHECK_INTERVAL: usize = 256;
@@ -500,8 +501,7 @@ impl<F: FnMut() -> bool> BoundedSearch<'_, F> {
     ) -> Option<Vec<CarIndex>> {
         self.nodes += 1;
         if self.nodes > BOUNDED_NODE_LIMIT
-            || (self.nodes.is_multiple_of(DEADLINE_CHECK_INTERVAL)
-                && (self.deadline_exceeded)())
+            || (self.nodes.is_multiple_of(DEADLINE_CHECK_INTERVAL) && (self.deadline_exceeded)())
         {
             return None;
         }
@@ -596,27 +596,131 @@ fn complete_two_slots(
     None
 }
 
-fn randomized_bounded_search<R: rand::Rng, F: FnMut() -> bool>(
+fn complete_three_slots<F: FnMut() -> bool>(
     cars: &[Car],
     pool: &[CarIndex],
+    used: &[bool],
+    sum: u64,
+    accepted: (u64, u64),
+    deadline_exceeded: &mut F,
+) -> Option<[CarIndex; 3]> {
+    for (first_position, &first) in pool.iter().enumerate() {
+        if used[first] {
+            continue;
+        }
+        if first_position.is_multiple_of(DEADLINE_CHECK_INTERVAL) && deadline_exceeded() {
+            return None;
+        }
+        let mut left = first_position + 1;
+        let mut right = pool.len().checked_sub(1)?;
+        while left < right {
+            while left < right && used[pool[left]] {
+                left += 1;
+            }
+            while left < right && used[pool[right]] {
+                right -= 1;
+            }
+            if left >= right {
+                break;
+            }
+            let total = sum
+                + u64::from(cars[first].lap_time)
+                + u64::from(cars[pool[left]].lap_time)
+                + u64::from(cars[pool[right]].lap_time);
+            if total < accepted.0 {
+                left += 1;
+            } else if total > accepted.1 {
+                right -= 1;
+            } else {
+                return Some([first, pool[left], pool[right]]);
+            }
+        }
+    }
+    None
+}
+
+struct RandomizedSearchRequest<'a> {
+    pool: &'a [CarIndex],
     lap_count: usize,
     target: u64,
     accepted: (u64, u64),
+    attempt_limit: usize,
+    prefer_directed: bool,
+}
+
+fn randomized_bounded_search<R: rand::Rng, F: FnMut() -> bool>(
+    cars: &[Car],
+    request: RandomizedSearchRequest<'_>,
     rng: &mut R,
     deadline_exceeded: &mut F,
 ) -> Option<Vec<CarIndex>> {
-    for attempt in 0..BOUNDED_RANDOM_ATTEMPTS {
+    let RandomizedSearchRequest {
+        pool,
+        lap_count,
+        target,
+        accepted,
+        attempt_limit,
+        prefer_directed,
+    } = request;
+    let minimum = pool
+        .iter()
+        .take(lap_count)
+        .map(|&index| u64::from(cars[index].lap_time))
+        .sum::<u64>();
+    let maximum = pool
+        .iter()
+        .rev()
+        .take(lap_count)
+        .map(|&index| u64::from(cars[index].lap_time))
+        .sum::<u64>();
+    let span = maximum.saturating_sub(minimum);
+    let needs_directed_extreme = target <= minimum + span / 10 || target >= minimum + span * 3 / 5;
+
+    for attempt in 0..attempt_limit {
         if attempt % DEADLINE_CHECK_INTERVAL == 0 && deadline_exceeded() {
             return None;
         }
         let mut selected = Vec::with_capacity(lap_count);
         let mut used = vec![false; cars.len()];
         let mut sum = 0_u64;
-        let construction_slots = lap_count.saturating_sub(2);
-        for _ in 0..construction_slots {
-            let available = pool.iter().copied().filter(|&index| !used[index]);
-            let count = pool.len() - selected.len();
-            let index = available.clone().nth(rng.random_range(0..count))?;
+        let directed = (prefer_directed && attempt < 8) || (attempt == 0 && needs_directed_extreme);
+        let construction_slots = lap_count.saturating_sub(if directed { 3 } else { 2 });
+        for slot in 0..construction_slots {
+            let available = pool
+                .iter()
+                .copied()
+                .filter(|&index| !used[index])
+                .collect::<Vec<_>>();
+            let index = if directed {
+                let remaining_after = lap_count - slot - 1;
+                let mut feasible = available
+                    .iter()
+                    .copied()
+                    .filter(|&candidate| {
+                        let candidate_sum = sum + u64::from(cars[candidate].lap_time);
+                        let mut rest = available
+                            .iter()
+                            .copied()
+                            .filter(|&index| index != candidate)
+                            .map(|index| u64::from(cars[index].lap_time));
+                        let min_add = rest.by_ref().take(remaining_after).sum::<u64>();
+                        let max_add = available
+                            .iter()
+                            .rev()
+                            .copied()
+                            .filter(|&index| index != candidate)
+                            .take(remaining_after)
+                            .map(|index| u64::from(cars[index].lap_time))
+                            .sum::<u64>();
+                        candidate_sum + min_add <= accepted.1
+                            && candidate_sum + max_add >= accepted.0
+                    })
+                    .collect::<Vec<_>>();
+                feasible.shuffle(rng);
+                *feasible.first()?
+            } else {
+                available[rng.random_range(0..available.len())]
+            };
             used[index] = true;
             selected.push(index);
             sum += u64::from(cars[index].lap_time);
@@ -636,6 +740,13 @@ fn randomized_bounded_search<R: rand::Rng, F: FnMut() -> bool>(
             2 => {
                 if let Some(pair) = complete_two_slots(cars, pool, &used, sum, accepted) {
                     selected.extend(pair);
+                }
+            }
+            3 => {
+                if let Some(triple) =
+                    complete_three_slots(cars, pool, &used, sum, accepted, deadline_exceeded)
+                {
+                    selected.extend(triple);
                 }
             }
             _ => {}
@@ -667,18 +778,47 @@ fn bounded_find_approximate_subset_with_rng<R: rand::Rng, F: FnMut() -> bool>(
         pools.push((0..cars.len()).collect());
     }
     let reverse = rng.random_bool(0.5);
-    for pool in &mut pools {
+    let has_reuse_fallback = pools.len() > 1;
+    let mut global_pool = (0..cars.len()).collect::<Vec<_>>();
+    global_pool.sort_unstable_by_key(|&index| (cars[index].lap_time, index));
+    let global_minimum = global_pool
+        .iter()
+        .take(request.lap_count)
+        .map(|&index| u64::from(cars[index].lap_time))
+        .sum::<u64>();
+    let global_maximum = global_pool
+        .iter()
+        .rev()
+        .take(request.lap_count)
+        .map(|&index| u64::from(cars[index].lap_time))
+        .sum::<u64>();
+    let global_span = global_maximum.saturating_sub(global_minimum);
+    let target = u64::from(request.target);
+    let target_is_central = target >= global_minimum + global_span * 45 / 100
+        && target <= global_minimum + global_span * 55 / 100;
+    for (phase, pool) in pools.iter_mut().enumerate() {
         pool.sort_unstable_by_key(|&index| (cars[index].lap_time, index));
         pool.dedup();
         if pool.len() < request.lap_count {
             continue;
         }
+        let preserve_unused_quality = target_is_central
+            && request.previously_selected.len() < request.lap_count.saturating_mul(16);
+        let attempt_limit = if has_reuse_fallback && phase == 0 && !preserve_unused_quality {
+            BOUNDED_UNUSED_PHASE_ATTEMPTS
+        } else {
+            BOUNDED_RANDOM_ATTEMPTS
+        };
         let mut result = randomized_bounded_search(
             cars,
-            pool,
-            request.lap_count,
-            u64::from(request.target),
-            accepted,
+            RandomizedSearchRequest {
+                pool,
+                lap_count: request.lap_count,
+                target,
+                accepted,
+                attempt_limit,
+                prefer_directed: true,
+            },
             rng,
             &mut deadline_exceeded,
         );
@@ -2260,8 +2400,95 @@ mod tests {
         assert_eq!(theoretical_reuse_free_runs, 17);
         assert!(
             unique >= 16 * UI_LAP_COUNT,
-            "unused-first search should achieve at least 16 of 17 sum-feasible reuse-free groups"
+            "adaptive unused-first search should preserve at least 16 reuse-free groups"
         );
+    }
+
+    #[test]
+    #[ignore = "deterministic chart-range diagnostic; run with --ignored --nocapture"]
+    fn bundled_cars_chart_range_diagnostic() {
+        use std::io::Write;
+
+        const TARGET_SAMPLES: usize = 10;
+        const MULTI_RUN_TIMEOUT_MS: f64 = 1_000.0;
+
+        let cars = read_cars_from_csv_string(include_str!("cars.csv")).unwrap();
+        let (min_target, max_target) = get_target_range_for_subset(&cars, UI_LAP_COUNT);
+        let started = Instant::now();
+        let mut bounded_valid = 0;
+        let mut legacy_valid = 0;
+        let mut multi_success = 0;
+
+        for sample in 0..TARGET_SAMPLES {
+            let target = (u64::from(min_target)
+                + (u64::from(max_target) - u64::from(min_target)) * sample as u64
+                    / (TARGET_SAMPLES - 1) as u64) as u32;
+            let accepted = accepted_sum_interval(target, defaults::TOLERANCE_PERCENT);
+
+            let run_single = |strategy, seed| {
+                let single_started = Instant::now();
+                let mut rng = StdRng::seed_from_u64(seed);
+                let result = find_approximate_subset_with_strategy_and_rng(
+                    strategy,
+                    &cars,
+                    target,
+                    UI_LAP_COUNT,
+                    &HashSet::new(),
+                    defaults::TOLERANCE_PERCENT,
+                    &mut rng,
+                );
+                let valid = result.as_ref().is_ok_and(|subset| {
+                    validate_bounded_subset(&cars, subset, UI_LAP_COUNT, target, accepted).is_ok()
+                });
+                (
+                    valid,
+                    result.err().map(|error| error.to_string()),
+                    single_started.elapsed(),
+                )
+            };
+
+            let (bounded_ok, bounded_error, bounded_elapsed) =
+                run_single(SolverStrategy::Bounded, 0xB0_0000 + sample as u64);
+            let (legacy_ok, legacy_error, legacy_elapsed) =
+                run_single(SolverStrategy::Legacy, 0x1E_0000 + sample as u64);
+            bounded_valid += usize::from(bounded_ok);
+            legacy_valid += usize::from(legacy_ok);
+
+            let multi_started = Instant::now();
+            let multi_result = perform_multiple_runs(
+                &cars,
+                target,
+                UI_LAP_COUNT,
+                UI_PLAYER_COUNT,
+                MULTI_RUN_TIMEOUT_MS,
+                defaults::TOLERANCE_PERCENT,
+            );
+            let multi_elapsed = multi_started.elapsed();
+            let multi_ok = multi_result.as_ref().is_ok_and(|subsets| {
+                subsets.len() == UI_PLAYER_COUNT
+                    && subsets.iter().all(|subset| {
+                        validate_bounded_subset(&cars, subset, UI_LAP_COUNT, target, accepted)
+                            .is_ok()
+                    })
+            });
+            multi_success += usize::from(multi_ok);
+            let multi_detail = match &multi_result {
+                Ok(subsets) => format!("{} subsets", subsets.len()),
+                Err(error) => error.to_string(),
+            };
+
+            println!(
+                "chart-range {}/{TARGET_SAMPLES}: target={target}, bounded_valid={bounded_ok} ({bounded_elapsed:?}, {bounded_error:?}), legacy_valid={legacy_ok} ({legacy_elapsed:?}, {legacy_error:?}), multi_valid={multi_ok} ({multi_elapsed:?}, {multi_detail})",
+                sample + 1,
+            );
+            std::io::stdout().flush().unwrap();
+        }
+
+        println!(
+            "chart-range summary: range={min_target}..={max_target}, samples={TARGET_SAMPLES}, bounded_valid={bounded_valid}/{TARGET_SAMPLES}, legacy_valid={legacy_valid}/{TARGET_SAMPLES}, multi_success={multi_success}/{TARGET_SAMPLES}, elapsed={:?}",
+            started.elapsed(),
+        );
+        std::io::stdout().flush().unwrap();
     }
 
     #[test]
