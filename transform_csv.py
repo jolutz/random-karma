@@ -1,36 +1,95 @@
+#!/usr/bin/env python3
+"""Extract vehicle and lap-time columns from an exported CSV file."""
+
+from __future__ import annotations
+
+import argparse
 import csv
+import os
+import sys
+import tempfile
+from pathlib import Path
 
-input_file = "/home/jonas/workspace/random_karma/src/cars.csv"
-output_file = "/home/jonas/workspace/random_karma/src/cars.csv"  # Overwrite the same file
+VEHICLE_HEADER = "Vehicle"
+LAP_TIME_HEADER = "Lap Time (m:ss.000)"
 
-with open(input_file, "r", newline="") as infile:
-    reader = csv.reader(infile)
-    rows = list(reader)
 
-# Find the header row (the one containing 'Vehicle' and 'Lap Time (m:ss.000)')
-header_row = None
-for i, row in enumerate(rows):
-    if "Vehicle" in row and "Lap Time (m:ss.000)" in row:
-        header_row = i
-        break
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=Path, help="source CSV exported from the game")
+    parser.add_argument("output", type=Path, help="destination CSV containing vehicle,lap_time")
+    parser.add_argument(
+        "--in-place",
+        action="store_true",
+        help="allow output to replace the input after a successful transformation",
+    )
+    return parser.parse_args()
 
-if header_row is None:
-    raise Exception("Could not find header row with Vehicle and Lap Time (m:ss.000)")
 
-vehicle_idx = rows[header_row].index("Vehicle")
-laptime_idx = rows[header_row].index("Lap Time (m:ss.000)")
+def transform(input_path: Path, output_path: Path, allow_in_place: bool) -> int:
+    if not input_path.is_file():
+        raise ValueError(f"input file does not exist: {input_path}")
+    if input_path.resolve() == output_path.resolve() and not allow_in_place:
+        raise ValueError("refusing to overwrite input; pass --in-place to allow it")
 
-# Extract only vehicle and lap time columns, skipping any non-data rows
-out_rows = [["vehicle", "lap_time"]]
-for row in rows[header_row + 1 :]:
-    if len(row) > max(vehicle_idx, laptime_idx):
-        vehicle = row[vehicle_idx].strip()
-        lap_time = row[laptime_idx].strip()
+    with input_path.open("r", encoding="utf-8-sig", newline="") as source:
+        rows = list(csv.reader(source))
+
+    header_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if VEHICLE_HEADER in row and LAP_TIME_HEADER in row
+        ),
+        None,
+    )
+    if header_index is None:
+        raise ValueError(
+            f"could not find a header containing {VEHICLE_HEADER!r} and {LAP_TIME_HEADER!r}"
+        )
+
+    header = rows[header_index]
+    vehicle_index = header.index(VEHICLE_HEADER)
+    lap_time_index = header.index(LAP_TIME_HEADER)
+    extracted = [("vehicle", "lap_time")]
+
+    for row in rows[header_index + 1 :]:
+        if len(row) <= max(vehicle_index, lap_time_index):
+            continue
+        vehicle = row[vehicle_index].strip()
+        lap_time = row[lap_time_index].strip()
         if vehicle and lap_time:
-            out_rows.append([vehicle, lap_time])
+            extracted.append((vehicle, lap_time))
 
-with open(output_file, "w", newline="") as outfile:
-    writer = csv.writer(outfile)
-    writer.writerows(out_rows)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_path = tempfile.mkstemp(
+        dir=output_path.parent,
+        prefix=f".{output_path.name}.",
+        suffix=".tmp",
+        text=True,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as destination:
+            csv.writer(destination).writerows(extracted)
+        Path(temporary_path).replace(output_path)
+    except BaseException:
+        Path(temporary_path).unlink(missing_ok=True)
+        raise
 
-print(f"Successfully transformed {output_file}")
+    return len(extracted) - 1
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        count = transform(args.input, args.output, args.in_place)
+    except (OSError, ValueError, csv.Error) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+    print(f"wrote {count} vehicle rows to {args.output}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

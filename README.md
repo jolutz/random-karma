@@ -51,6 +51,22 @@ GT3-03,103s
 - Column 2 is a lap time accepted as `M:SS`, `Mm SSs`, or `SSs`.
 - Invalid or incomplete rows are skipped. Additional columns are ignored.
 
+### Regenerating the bundled data
+
+Use `transform_csv.py` to extract the `Vehicle` and `Lap Time (m:ss.000)` columns from a game export without modifying the source file:
+
+```sh
+python3 transform_csv.py export.csv src/cars.csv
+```
+
+To intentionally replace an input file, pass `--in-place` explicitly:
+
+```sh
+python3 transform_csv.py src/cars.csv src/cars.csv --in-place
+```
+
+The script writes to a temporary file and atomically replaces the destination only after a successful transformation.
+
 ## Validate, build, and deploy
 
 Run the same main checks locally:
