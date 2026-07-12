@@ -1,6 +1,7 @@
 use log::{debug, info, warn};
 use rand::distr::weighted::WeightedIndex;
-use rand::seq::SliceRandom; // Add this line
+
+use rand::seq::SliceRandom;
 use rand_distr::Distribution;
 use std::cmp::Ordering;
 use std::collections::HashSet;
@@ -46,6 +47,13 @@ pub enum SubsetError {
         required: usize,
         found: usize,
     },
+    InvalidTolerance(f64),
+    InvalidTimeout(f64),
+    InvalidPriorIndex(CarIndex),
+    ImpossibleCount {
+        requested: usize,
+        available: usize,
+    },
 }
 
 impl fmt::Display for SubsetError {
@@ -83,6 +91,13 @@ impl fmt::Display for SubsetError {
                 f,
                 "Only {}/{} satisfactory subsets found within tolerance",
                 found, required
+            ),
+            SubsetError::InvalidTolerance(value) => write!(f, "Invalid tolerance: {value}"),
+            SubsetError::InvalidTimeout(value) => write!(f, "Invalid timeout: {value}"),
+            SubsetError::InvalidPriorIndex(index) => write!(f, "Invalid prior index: {index}"),
+            SubsetError::ImpossibleCount { requested, available } => write!(
+                f,
+                "Cannot select {requested} unique cars from {available} cars"
             ),
         }
     }
@@ -305,6 +320,14 @@ fn try_extend_with_previous(
 
 /// Helper function to calculate sum of lap times for a subset
 #[inline]
+fn calculate_subset_sum_u64(cars: &[Car], subset: &[CarIndex]) -> u64 {
+    subset
+        .iter()
+        .map(|&idx| u64::from(get_lap_time(cars, idx)))
+        .sum()
+}
+
+#[inline]
 fn calculate_subset_sum(cars: &[Car], subset: &[CarIndex]) -> u32 {
     subset
         .iter()
@@ -333,9 +356,17 @@ fn is_timeout_exceeded(start_time: f64, max_runtime_ms: f64) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SolverStrategy {
     Legacy,
+    Bounded,
 }
 
-pub const DEFAULT_SOLVER_STRATEGY: SolverStrategy = SolverStrategy::Legacy;
+/// Change this one constant to `Legacy` to roll back the public solver.
+pub const DEFAULT_SOLVER_STRATEGY: SolverStrategy = SolverStrategy::Bounded;
+
+const BOUNDED_NODE_LIMIT: usize = 500_000;
+const BOUNDED_RANDOM_ATTEMPTS: usize = 512;
+
+const EXACT_POOL_LIMIT: usize = 20;
+const DEADLINE_CHECK_INTERVAL: usize = 256;
 
 pub fn find_approximate_subset(
     cars: &[Car],
@@ -365,6 +396,22 @@ fn find_approximate_subset_with_strategy_and_rng<R: rand::Rng>(
     tolerance_percent: f64,
     rng: &mut R,
 ) -> Result<Vec<CarIndex>, SubsetError> {
+    if !tolerance_percent.is_finite() || tolerance_percent < 0.0 {
+        return Err(SubsetError::InvalidTolerance(tolerance_percent));
+    }
+    if let Some(&index) = previously_selected
+        .iter()
+        .find(|&&index| index >= cars.len())
+    {
+        return Err(SubsetError::InvalidPriorIndex(index));
+    }
+    if lap_count > cars.len() {
+        return Err(SubsetError::ImpossibleCount {
+            requested: lap_count,
+            available: cars.len(),
+        });
+    }
+
     let available_indexes: Vec<CarIndex> = (0..cars.len())
         .filter(|idx| !previously_selected.contains(idx))
         .collect();
@@ -378,7 +425,290 @@ fn find_approximate_subset_with_strategy_and_rng<R: rand::Rng>(
             tolerance_percent,
             rng,
         ),
+        SolverStrategy::Bounded => {
+            let request = BoundedRequest {
+                target,
+                lap_count,
+                tolerance_percent,
+                unused: &available_indexes,
+                previously_selected,
+            };
+            bounded_find_approximate_subset_with_rng(cars, request, rng, || false)
+        }
     }
+}
+
+fn accepted_sum_interval(target: u32, tolerance_percent: f64) -> (u64, u64) {
+    let target = f64::from(target);
+    let lower = (target * (1.0 - tolerance_percent / 100.0)).ceil().max(0.0) as u64;
+    let upper = (target * (1.0 + tolerance_percent / 100.0))
+        .floor()
+        .max(0.0) as u64;
+    (lower, upper)
+}
+
+fn validate_bounded_subset(
+    cars: &[Car],
+    subset: &[CarIndex],
+    lap_count: usize,
+    target: u32,
+    accepted: (u64, u64),
+) -> Result<(), SubsetError> {
+    if subset.len() != lap_count
+        || subset.iter().any(|&index| index >= cars.len())
+        || subset.iter().copied().collect::<HashSet<_>>().len() != subset.len()
+    {
+        return Err(SubsetError::NoValidSubset);
+    }
+    let sum = calculate_subset_sum_u64(cars, subset);
+    if (accepted.0..=accepted.1).contains(&sum) {
+        Ok(())
+    } else {
+        Err(SubsetError::OutsideTolerance(if target == 0 {
+            f64::INFINITY
+        } else {
+            sum as f64 / f64::from(target) * 100.0
+        }))
+    }
+}
+
+struct BoundedRequest<'a> {
+    target: u32,
+    lap_count: usize,
+    tolerance_percent: f64,
+    unused: &'a [CarIndex],
+    previously_selected: &'a HashSet<CarIndex>,
+}
+
+struct BoundedSearch<'a, F> {
+    cars: &'a [Car],
+    pool: &'a [CarIndex],
+    accepted: (u64, u64),
+    target: u64,
+    nodes: usize,
+    deadline_exceeded: &'a mut F,
+}
+
+impl<F: FnMut() -> bool> BoundedSearch<'_, F> {
+    fn visit(
+        &mut self,
+        start: usize,
+        remaining: usize,
+        sum: u64,
+        chosen: &mut Vec<CarIndex>,
+        reverse: bool,
+    ) -> Option<Vec<CarIndex>> {
+        self.nodes += 1;
+        if self.nodes > BOUNDED_NODE_LIMIT
+            || (self.nodes.is_multiple_of(DEADLINE_CHECK_INTERVAL)
+                && (self.deadline_exceeded)())
+        {
+            return None;
+        }
+        if remaining == 0 {
+            return (self.accepted.0..=self.accepted.1)
+                .contains(&sum)
+                .then(|| chosen.clone());
+        }
+        if self.pool.len().saturating_sub(start) < remaining {
+            return None;
+        }
+
+        let min_add = self.pool[start..start + remaining]
+            .iter()
+            .map(|&index| u64::from(self.cars[index].lap_time))
+            .sum::<u64>();
+        let max_add = self.pool[self.pool.len() - remaining..]
+            .iter()
+            .map(|&index| u64::from(self.cars[index].lap_time))
+            .sum::<u64>();
+        if sum + min_add > self.accepted.1 || sum + max_add < self.accepted.0 {
+            return None;
+        }
+
+        let end = self.pool.len() - remaining;
+        let wanted = self.target.saturating_sub(sum) / remaining as u64;
+        let pivot = self.pool[start..=end]
+            .partition_point(|&index| u64::from(self.cars[index].lap_time) < wanted)
+            + start;
+        for distance in 0..=end - start {
+            let right = pivot
+                .checked_add(distance)
+                .filter(|&position| position <= end);
+            let left = pivot
+                .checked_sub(distance + 1)
+                .filter(|&position| position >= start);
+            for position in if reverse {
+                [right, left]
+            } else {
+                [left, right]
+            }
+            .into_iter()
+            .flatten()
+            {
+                let index = self.pool[position];
+                chosen.push(index);
+                if let Some(result) = self.visit(
+                    position + 1,
+                    remaining - 1,
+                    sum + u64::from(self.cars[index].lap_time),
+                    chosen,
+                    reverse,
+                ) {
+                    return Some(result);
+                }
+                chosen.pop();
+            }
+        }
+        None
+    }
+}
+
+fn complete_two_slots(
+    cars: &[Car],
+    pool: &[CarIndex],
+    used: &[bool],
+    sum: u64,
+    accepted: (u64, u64),
+) -> Option<[CarIndex; 2]> {
+    let mut left = 0;
+    let mut right = pool.len().checked_sub(1)?;
+    while left < right {
+        while left < right && used[pool[left]] {
+            left += 1;
+        }
+        while left < right && used[pool[right]] {
+            right -= 1;
+        }
+        if left >= right {
+            break;
+        }
+        let total =
+            sum + u64::from(cars[pool[left]].lap_time) + u64::from(cars[pool[right]].lap_time);
+        if total < accepted.0 {
+            left += 1;
+        } else if total > accepted.1 {
+            right -= 1;
+        } else {
+            return Some([pool[left], pool[right]]);
+        }
+    }
+    None
+}
+
+fn randomized_bounded_search<R: rand::Rng, F: FnMut() -> bool>(
+    cars: &[Car],
+    pool: &[CarIndex],
+    lap_count: usize,
+    target: u64,
+    accepted: (u64, u64),
+    rng: &mut R,
+    deadline_exceeded: &mut F,
+) -> Option<Vec<CarIndex>> {
+    for attempt in 0..BOUNDED_RANDOM_ATTEMPTS {
+        if attempt % DEADLINE_CHECK_INTERVAL == 0 && deadline_exceeded() {
+            return None;
+        }
+        let mut selected = Vec::with_capacity(lap_count);
+        let mut used = vec![false; cars.len()];
+        let mut sum = 0_u64;
+        let construction_slots = lap_count.saturating_sub(2);
+        for _ in 0..construction_slots {
+            let available = pool.iter().copied().filter(|&index| !used[index]);
+            let count = pool.len() - selected.len();
+            let index = available.clone().nth(rng.random_range(0..count))?;
+            used[index] = true;
+            selected.push(index);
+            sum += u64::from(cars[index].lap_time);
+        }
+
+        match lap_count - construction_slots {
+            1 => {
+                let wanted = target.saturating_sub(sum);
+                if let Some(&index) = pool
+                    .iter()
+                    .filter(|&&index| !used[index])
+                    .min_by_key(|&&index| u64::from(cars[index].lap_time).abs_diff(wanted))
+                {
+                    selected.push(index);
+                }
+            }
+            2 => {
+                if let Some(pair) = complete_two_slots(cars, pool, &used, sum, accepted) {
+                    selected.extend(pair);
+                }
+            }
+            _ => {}
+        }
+        if selected.len() == lap_count
+            && (accepted.0..=accepted.1).contains(&calculate_subset_sum_u64(cars, &selected))
+        {
+            return Some(selected);
+        }
+    }
+    None
+}
+
+fn bounded_find_approximate_subset_with_rng<R: rand::Rng, F: FnMut() -> bool>(
+    cars: &[Car],
+    request: BoundedRequest<'_>,
+    rng: &mut R,
+    mut deadline_exceeded: F,
+) -> Result<Vec<CarIndex>, SubsetError> {
+    let accepted = accepted_sum_interval(request.target, request.tolerance_percent);
+    if request.lap_count == 0 {
+        let result = Vec::new();
+        validate_bounded_subset(cars, &result, 0, request.target, accepted)?;
+        return Ok(result);
+    }
+
+    let mut pools = vec![request.unused.to_vec()];
+    if !request.previously_selected.is_empty() {
+        pools.push((0..cars.len()).collect());
+    }
+    let reverse = rng.random_bool(0.5);
+    for pool in &mut pools {
+        pool.sort_unstable_by_key(|&index| (cars[index].lap_time, index));
+        pool.dedup();
+        if pool.len() < request.lap_count {
+            continue;
+        }
+        let mut result = randomized_bounded_search(
+            cars,
+            pool,
+            request.lap_count,
+            u64::from(request.target),
+            accepted,
+            rng,
+            &mut deadline_exceeded,
+        );
+        if result.is_none() && pool.len() <= EXACT_POOL_LIMIT {
+            let mut search = BoundedSearch {
+                cars,
+                pool,
+                accepted,
+                target: u64::from(request.target),
+                nodes: 0,
+                deadline_exceeded: &mut deadline_exceeded,
+            };
+            result = search.visit(
+                0,
+                request.lap_count,
+                0,
+                &mut Vec::with_capacity(request.lap_count),
+                reverse,
+            );
+        }
+        if let Some(mut result) = result {
+            result.shuffle(rng);
+            validate_bounded_subset(cars, &result, request.lap_count, request.target, accepted)?;
+            return Ok(result);
+        }
+        if deadline_exceeded() {
+            return Err(SubsetError::NoValidSubset);
+        }
+    }
+    Err(SubsetError::NoValidSubset)
 }
 
 fn legacy_find_approximate_subset_from_candidates(
@@ -704,6 +1034,9 @@ fn select_candidate<R: rand::Rng>(
 
 fn calculate_min_max_sums(cars: &[Car], indexes: &[CarIndex], x: usize) -> (u32, u32) {
     // Assuming 'indexes' is already sorted by lap_time ascending.
+    if x > indexes.len() {
+        return (0, 0);
+    }
     if indexes.is_empty() || x == 0 {
         return (0, 0);
     }
@@ -1017,9 +1350,21 @@ pub fn perform_multiple_runs(
     timeout_ms: f64,
     tolerance_percent: f64,
 ) -> Result<Vec<Vec<CarIndex>>, SubsetError> {
+    if !timeout_ms.is_finite() || timeout_ms < 0.0 {
+        return Err(SubsetError::InvalidTimeout(timeout_ms));
+    }
+    if !tolerance_percent.is_finite() || tolerance_percent < 0.0 {
+        return Err(SubsetError::InvalidTolerance(tolerance_percent));
+    }
+    if lap_count > global_cars.len() {
+        return Err(SubsetError::ImpossibleCount {
+            requested: lap_count,
+            available: global_cars.len(),
+        });
+    }
+
     // ---------- timeout set-up ----------
-    // Use the provided timeout instead of hardcoded value
-    let max_runtime_ms: f64 = timeout_ms.max(100.0); // Ensure minimum 100ms
+    let max_runtime_ms: f64 = timeout_ms.max(100.0);
     #[cfg(not(target_arch = "wasm32"))]
     let start_time = Instant::now();
     #[cfg(target_arch = "wasm32")]
@@ -1070,16 +1415,37 @@ pub fn perform_multiple_runs(
                 });
             }
 
-            let attempt = match legacy_find_approximate_subset_from_candidates(
-                global_cars,
-                target,
-                lap_count,
-                &available_indexes,
-                &previously_selected,
-                tolerance_percent,
-            ) {
+            let mut rng = rand::rng();
+            let attempt = match match DEFAULT_SOLVER_STRATEGY {
+                SolverStrategy::Legacy => legacy_find_approximate_subset_from_candidates(
+                    global_cars,
+                    target,
+                    lap_count,
+                    &available_indexes,
+                    &previously_selected,
+                    tolerance_percent,
+                ),
+                SolverStrategy::Bounded => bounded_find_approximate_subset_with_rng(
+                    global_cars,
+                    BoundedRequest {
+                        target,
+                        lap_count,
+                        tolerance_percent,
+                        unused: &available_indexes,
+                        previously_selected: &previously_selected,
+                    },
+                    &mut rng,
+                    || is_timeout_exceeded(start_time, max_runtime_ms),
+                ),
+            } {
                 Ok(subset) => subset,
                 Err(err) => {
+                    if is_timeout_exceeded(start_time, max_runtime_ms) {
+                        return Err(SubsetError::NotEnoughSuccessfulRuns {
+                            required: player_count,
+                            found: all_results.len(),
+                        });
+                    }
                     warn!(
                         "Run {}/{}: Failed to find a valid subset: {}",
                         run, player_count, err
@@ -1088,15 +1454,16 @@ pub fn perform_multiple_runs(
                 }
             };
 
-            let subset_sum = calculate_subset_sum(global_cars, &attempt);
-            let accuracy = accuracy_percent(subset_sum, target);
-
-            if !within_tolerance(accuracy, tolerance_percent) {
-                warn!(
-                    "Current run's sum is more than {}% off ({}%), retrying...",
-                    tolerance_percent, accuracy
-                );
-                continue;
+            if DEFAULT_SOLVER_STRATEGY == SolverStrategy::Legacy {
+                let subset_sum = calculate_subset_sum(global_cars, &attempt);
+                let accuracy = accuracy_percent(subset_sum, target);
+                if !within_tolerance(accuracy, tolerance_percent) {
+                    warn!(
+                        "Current run's sum is more than {}% off ({}%), retrying...",
+                        tolerance_percent, accuracy
+                    );
+                    continue;
+                }
             }
             break attempt;
         };
@@ -1310,7 +1677,8 @@ pub async fn worker_perform_multiple_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use std::time::Instant;
 
     fn car(id: &str, lap_time: u32) -> Car {
         Car {
@@ -1552,7 +1920,7 @@ mod tests {
     #[test]
     fn aggregate_sum_preserves_values_above_u32_max() {
         let cars = vec![car("max", u32::MAX), car("one", 1)];
-        let mathematical_sum = u64::from(calculate_subset_sum(&cars, &[0, 1]));
+        let mathematical_sum = calculate_subset_sum_u64(&cars, &[0, 1]);
 
         assert_eq!(mathematical_sum, u64::from(u32::MAX) + 1);
     }
@@ -1658,7 +2026,7 @@ mod tests {
     }
 
     #[test]
-    fn seeded_legacy_results_match_the_brute_force_oracle() {
+    fn seeded_bounded_results_match_the_brute_force_oracle() {
         let cars = vec![car("low", 20), car("middle", 60), car("high", 100)];
         let oracle = brute_force_valid_subsets(&cars, 2, 120, 0.0);
         assert_eq!(oracle, vec![vec![0, 2]]);
@@ -1666,7 +2034,7 @@ mod tests {
         for seed in 0..32 {
             let mut rng = StdRng::seed_from_u64(seed);
             if let Ok(mut subset) = find_approximate_subset_with_strategy_and_rng(
-                SolverStrategy::Legacy,
+                SolverStrategy::Bounded,
                 &cars,
                 120,
                 2,
@@ -1684,7 +2052,230 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "current solver accepts infinite timeouts and may never terminate"]
+    fn legacy_seed_zero_documents_non_oracle_result() {
+        let cars = vec![car("low", 20), car("middle", 60), car("high", 100)];
+        let mut rng = StdRng::seed_from_u64(0);
+        let mut subset = find_approximate_subset_with_strategy_and_rng(
+            SolverStrategy::Legacy,
+            &cars,
+            120,
+            2,
+            &HashSet::new(),
+            0.0,
+            &mut rng,
+        )
+        .expect("legacy seed zero returns a subset");
+        subset.sort_unstable();
+        assert_eq!(subset, vec![0, 1], "documents the legacy validation defect");
+    }
+
+    #[test]
+    fn bounded_solver_is_complete_on_tractable_random_instances() {
+        let mut data_rng = StdRng::seed_from_u64(0x5eed);
+        for case in 0..100 {
+            let count = data_rng.random_range(5..=10);
+            let cars: Vec<_> = (0..count)
+                .map(|index| car(&index.to_string(), data_rng.random_range(0..=100)))
+                .collect();
+            let lap_count = data_rng.random_range(0..=count.min(5));
+            let target = data_rng.random_range(0..=400);
+            let tolerance = data_rng.random_range(0..=10) as f64;
+            let oracle = brute_force_valid_subsets(&cars, lap_count, target, tolerance);
+            let mut solver_rng = StdRng::seed_from_u64(case);
+            let result = find_approximate_subset_with_strategy_and_rng(
+                SolverStrategy::Bounded,
+                &cars,
+                target,
+                lap_count,
+                &HashSet::new(),
+                tolerance,
+                &mut solver_rng,
+            );
+            assert_eq!(
+                result.is_ok(),
+                !oracle.is_empty(),
+                "case {case}: target={target}, count={lap_count}, cars={cars:?}"
+            );
+            if let Ok(subset) = result {
+                assert_valid_subset(&cars, &subset, lap_count, target, tolerance);
+            }
+        }
+    }
+
+    const UI_TARGET: u32 = 2_800_000;
+    const UI_LAP_COUNT: usize = 25;
+    const UI_PLAYER_COUNT: usize = 32;
+
+    #[derive(Default)]
+    struct SolverMetrics {
+        valid: usize,
+        failures: usize,
+        invalid: usize,
+        latencies: Vec<std::time::Duration>,
+        subsets: HashSet<Vec<CarIndex>>,
+    }
+
+    impl SolverMetrics {
+        fn record(
+            &mut self,
+            cars: &[Car],
+            result: Result<Vec<CarIndex>, SubsetError>,
+            elapsed: std::time::Duration,
+        ) {
+            self.latencies.push(elapsed);
+            match result {
+                Ok(mut subset)
+                    if validate_bounded_subset(
+                        cars,
+                        &subset,
+                        UI_LAP_COUNT,
+                        UI_TARGET,
+                        accepted_sum_interval(UI_TARGET, defaults::TOLERANCE_PERCENT),
+                    )
+                    .is_ok() =>
+                {
+                    self.valid += 1;
+                    subset.sort_unstable();
+                    self.subsets.insert(subset);
+                }
+                Ok(_) => self.invalid += 1,
+                Err(_) => self.failures += 1,
+            }
+        }
+
+        fn percentile(&self, numerator: usize, denominator: usize) -> std::time::Duration {
+            let mut values = self.latencies.clone();
+            values.sort_unstable();
+            values[(values.len() - 1) * numerator / denominator]
+        }
+
+        fn report(&self, name: &str) {
+            println!(
+                "{name}: valid={}, failures={}, invalid={}, unique={}, total={:?}, median={:?}, p95={:?}",
+                self.valid,
+                self.failures,
+                self.invalid,
+                self.subsets.len(),
+                self.latencies.iter().sum::<std::time::Duration>(),
+                self.percentile(1, 2),
+                self.percentile(95, 100),
+            );
+        }
+    }
+
+    fn bundled_strategy_metrics(strategy: SolverStrategy, seeds: u64) -> SolverMetrics {
+        let cars = read_cars_from_csv_string(include_str!("cars.csv")).unwrap();
+        let mut metrics = SolverMetrics::default();
+        for seed in 0..seeds {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let started = Instant::now();
+            let result = find_approximate_subset_with_strategy_and_rng(
+                strategy,
+                &cars,
+                UI_TARGET,
+                UI_LAP_COUNT,
+                &HashSet::new(),
+                defaults::TOLERANCE_PERCENT,
+                &mut rng,
+            );
+            metrics.record(&cars, result, started.elapsed());
+        }
+        metrics
+    }
+
+    #[test]
+    fn bundled_cars_solver_comparison_reports_metrics() {
+        let cars = read_cars_from_csv_string(include_str!("cars.csv")).unwrap();
+        assert_eq!(
+            cars.len(),
+            635,
+            "the comparison expects the bundled fixture"
+        );
+
+        let bounded = bundled_strategy_metrics(SolverStrategy::Bounded, 16);
+        let legacy = bundled_strategy_metrics(SolverStrategy::Legacy, 16);
+        bounded.report("bounded");
+        legacy.report("legacy");
+
+        assert_eq!(bounded.valid, 16, "bounded must validate for every seed");
+        assert_eq!(
+            bounded.invalid, 0,
+            "bounded must never return invalid subsets"
+        );
+        assert!(
+            bounded.valid >= legacy.valid,
+            "bounded valid-return rate should be at least legacy's"
+        );
+        assert!(
+            bounded.subsets.len() > 1,
+            "seeded traversal should retain useful diversity"
+        );
+    }
+
+    #[test]
+    fn bounded_full_default_workload_is_valid_and_reports_elapsed_time() {
+        let cars = read_cars_from_csv_string(include_str!("cars.csv")).unwrap();
+        let started = Instant::now();
+        let results = perform_multiple_runs(
+            &cars,
+            UI_TARGET,
+            UI_LAP_COUNT,
+            UI_PLAYER_COUNT,
+            defaults::TIMEOUT_MS,
+            defaults::TOLERANCE_PERCENT,
+        )
+        .expect("bounded solver should complete within the UI timeout");
+        let elapsed = started.elapsed();
+
+        assert_eq!(results.len(), UI_PLAYER_COUNT);
+        for subset in &results {
+            assert_valid_subset(
+                &cars,
+                subset,
+                UI_LAP_COUNT,
+                UI_TARGET,
+                defaults::TOLERANCE_PERCENT,
+            );
+        }
+        let unique = results
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>()
+            .len();
+        let selections = UI_LAP_COUNT * UI_PLAYER_COUNT;
+        let reused = selections - unique;
+        let total_available = cars
+            .iter()
+            .map(|entry| u64::from(entry.lap_time))
+            .sum::<u64>();
+        let minimum_valid_sum = accepted_sum_interval(UI_TARGET, defaults::TOLERANCE_PERCENT).0;
+        let sum_limited_runs = total_available / minimum_valid_sum;
+        let cardinality_limited_runs = cars.len() / UI_LAP_COUNT;
+        let theoretical_reuse_free_runs =
+            sum_limited_runs.min(cardinality_limited_runs as u64) as usize;
+        println!(
+            "default workload: players={UI_PLAYER_COUNT}, elapsed={elapsed:?}, unique_cars={unique}, reused_selections={reused}, theoretical_reuse_free_runs={theoretical_reuse_free_runs}"
+        );
+        assert_eq!(theoretical_reuse_free_runs, 17);
+        assert!(
+            unique >= 16 * UI_LAP_COUNT,
+            "unused-first search should achieve at least 16 of 17 sum-feasible reuse-free groups"
+        );
+    }
+
+    #[test]
+    #[ignore = "extended deterministic solver metrics; run with --ignored --nocapture"]
+    fn bundled_cars_extended_solver_comparison() {
+        let bounded = bundled_strategy_metrics(SolverStrategy::Bounded, 128);
+        let legacy = bundled_strategy_metrics(SolverStrategy::Legacy, 128);
+        bounded.report("bounded extended");
+        legacy.report("legacy extended");
+        assert_eq!((bounded.valid, bounded.invalid), (128, 0));
+        assert!(bounded.valid >= legacy.valid);
+    }
+
+    #[test]
     fn infinite_timeout_is_rejected() {
         let cars = vec![car("exact", 100)];
         assert!(perform_multiple_runs(&cars, 100, 1, 1, f64::INFINITY, 0.0).is_err());
