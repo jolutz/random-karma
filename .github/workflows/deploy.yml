@@ -37,7 +37,7 @@ jobs:
             ${{ runner.os }}-trunk-0.21.14-
 
       - name: Install Trunk
-        run: cargo install trunk --version 0.21.14 --locked
+        run: trunk --version || cargo install trunk --version 0.21.14 --locked
 
       - name: Build
         run: trunk build --release
