@@ -326,6 +326,17 @@ fn is_timeout_exceeded(start_time: f64, max_runtime_ms: f64) -> bool {
     js_sys::Date::now() - start_time > max_runtime_ms
 }
 
+/// Selects which solver implementation backs the stable public API.
+///
+/// The legacy strategy remains available so a future solver can be introduced
+/// and rolled back without restoring deleted code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SolverStrategy {
+    Legacy,
+}
+
+pub const DEFAULT_SOLVER_STRATEGY: SolverStrategy = SolverStrategy::Legacy;
+
 pub fn find_approximate_subset(
     cars: &[Car],
     target: u32,
@@ -333,26 +344,71 @@ pub fn find_approximate_subset(
     previously_selected: &HashSet<CarIndex>,
     tolerance_percent: f64,
 ) -> Result<Vec<CarIndex>, SubsetError> {
-    let available_indexes: Vec<CarIndex> = (0..cars.len())
-        .filter(|idx| !previously_selected.contains(idx))
-        .collect();
-    find_approximate_subset_from_candidates(
+    let mut rng = rand::rng();
+    find_approximate_subset_with_strategy_and_rng(
+        DEFAULT_SOLVER_STRATEGY,
         cars,
         target,
         lap_count,
-        &available_indexes,
         previously_selected,
         tolerance_percent,
+        &mut rng,
     )
 }
 
-fn find_approximate_subset_from_candidates(
+fn find_approximate_subset_with_strategy_and_rng<R: rand::Rng>(
+    strategy: SolverStrategy,
+    cars: &[Car],
+    target: u32,
+    lap_count: usize,
+    previously_selected: &HashSet<CarIndex>,
+    tolerance_percent: f64,
+    rng: &mut R,
+) -> Result<Vec<CarIndex>, SubsetError> {
+    let available_indexes: Vec<CarIndex> = (0..cars.len())
+        .filter(|idx| !previously_selected.contains(idx))
+        .collect();
+    match strategy {
+        SolverStrategy::Legacy => legacy_find_approximate_subset_from_candidates_with_rng(
+            cars,
+            target,
+            lap_count,
+            &available_indexes,
+            previously_selected,
+            tolerance_percent,
+            rng,
+        ),
+    }
+}
+
+fn legacy_find_approximate_subset_from_candidates(
     cars: &[Car],
     target: u32,
     lap_count: usize,
     candidate_indexes: &[CarIndex],
     previously_selected: &HashSet<CarIndex>,
     tolerance_percent: f64,
+) -> Result<Vec<CarIndex>, SubsetError> {
+    let mut rng = rand::rng();
+    legacy_find_approximate_subset_from_candidates_with_rng(
+        cars,
+        target,
+        lap_count,
+        candidate_indexes,
+        previously_selected,
+        tolerance_percent,
+        &mut rng,
+    )
+}
+
+fn legacy_find_approximate_subset_from_candidates_with_rng<R: rand::Rng>(
+    cars: &[Car],
+    target: u32,
+    lap_count: usize,
+    candidate_indexes: &[CarIndex],
+    previously_selected: &HashSet<CarIndex>,
+    tolerance_percent: f64,
+    rng: &mut R,
 ) -> Result<Vec<CarIndex>, SubsetError> {
     if !tolerance_percent.is_finite() || tolerance_percent < 0.0 {
         return Err(SubsetError::NoValidSubset);
@@ -365,7 +421,6 @@ fn find_approximate_subset_from_candidates(
         };
     }
 
-    let mut rng = rand::rng();
     let mut selected = Vec::new();
     let mut current_sum = 0;
     let mut remaining_indexes = candidate_indexes.to_vec();
@@ -520,7 +575,7 @@ fn find_approximate_subset_from_candidates(
                 current_sum,
                 target,
                 remaining_needed,
-                rng: &mut rng,
+                rng,
                 total_backtracks: &mut total_backtracks,
             },
         );
@@ -558,7 +613,7 @@ fn find_approximate_subset_from_candidates(
         );
 
         // Randomize the order of the selected subset before returning
-        selected.shuffle(&mut rng);
+        selected.shuffle(rng);
 
         return Ok(selected);
     }
@@ -1015,7 +1070,7 @@ pub fn perform_multiple_runs(
                 });
             }
 
-            let attempt = match find_approximate_subset_from_candidates(
+            let attempt = match legacy_find_approximate_subset_from_candidates(
                 global_cars,
                 target,
                 lap_count,
@@ -1255,6 +1310,7 @@ pub async fn worker_perform_multiple_runs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{rngs::StdRng, SeedableRng};
 
     fn car(id: &str, lap_time: u32) -> Car {
         Car {
@@ -1499,6 +1555,132 @@ mod tests {
         let mathematical_sum = u64::from(calculate_subset_sum(&cars, &[0, 1]));
 
         assert_eq!(mathematical_sum, u64::from(u32::MAX) + 1);
+    }
+
+    fn brute_force_valid_subsets(
+        cars: &[Car],
+        count: usize,
+        target: u32,
+        tolerance_percent: f64,
+    ) -> Vec<Vec<CarIndex>> {
+        fn visit(
+            cars: &[Car],
+            count: usize,
+            start: usize,
+            current: &mut Vec<CarIndex>,
+            output: &mut Vec<Vec<CarIndex>>,
+            target: u32,
+            tolerance_percent: f64,
+        ) {
+            if current.len() == count {
+                let sum = current
+                    .iter()
+                    .map(|&index| u64::from(cars[index].lap_time))
+                    .sum::<u64>();
+                let accuracy = match (sum, target) {
+                    (0, 0) => 100.0,
+                    (_, 0) => f64::INFINITY,
+                    _ => sum as f64 / target as f64 * 100.0,
+                };
+                if within_tolerance(accuracy, tolerance_percent) {
+                    output.push(current.clone());
+                }
+                return;
+            }
+
+            let remaining = count - current.len();
+            if cars.len().saturating_sub(start) < remaining {
+                return;
+            }
+            for index in start..cars.len() {
+                current.push(index);
+                visit(
+                    cars,
+                    count,
+                    index + 1,
+                    current,
+                    output,
+                    target,
+                    tolerance_percent,
+                );
+                current.pop();
+            }
+        }
+
+        let mut output = Vec::new();
+        visit(
+            cars,
+            count,
+            0,
+            &mut Vec::with_capacity(count),
+            &mut output,
+            target,
+            tolerance_percent,
+        );
+        output
+    }
+
+    #[test]
+    fn brute_force_oracle_enumerates_all_valid_small_subsets() {
+        let cars = vec![car("a", 20), car("b", 60), car("c", 100), car("d", 110)];
+        let subsets = brute_force_valid_subsets(&cars, 2, 120, 0.0);
+
+        assert_eq!(subsets, vec![vec![0, 2]]);
+    }
+
+    #[test]
+    fn legacy_solver_is_reproducible_for_a_fixed_seed() {
+        let cars = vec![car("a", 20), car("b", 60), car("c", 100), car("d", 110)];
+        let previous = HashSet::new();
+        let mut first_rng = StdRng::seed_from_u64(42);
+        let mut second_rng = StdRng::seed_from_u64(42);
+
+        let first = find_approximate_subset_with_strategy_and_rng(
+            SolverStrategy::Legacy,
+            &cars,
+            120,
+            2,
+            &previous,
+            0.0,
+            &mut first_rng,
+        );
+        let second = find_approximate_subset_with_strategy_and_rng(
+            SolverStrategy::Legacy,
+            &cars,
+            120,
+            2,
+            &previous,
+            0.0,
+            &mut second_rng,
+        );
+
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    }
+
+    #[test]
+    fn seeded_legacy_results_match_the_brute_force_oracle() {
+        let cars = vec![car("low", 20), car("middle", 60), car("high", 100)];
+        let oracle = brute_force_valid_subsets(&cars, 2, 120, 0.0);
+        assert_eq!(oracle, vec![vec![0, 2]]);
+
+        for seed in 0..32 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            if let Ok(mut subset) = find_approximate_subset_with_strategy_and_rng(
+                SolverStrategy::Legacy,
+                &cars,
+                120,
+                2,
+                &HashSet::new(),
+                0.0,
+                &mut rng,
+            ) {
+                subset.sort_unstable();
+                assert!(
+                    oracle.contains(&subset),
+                    "seed {seed} returned non-oracle subset {subset:?}"
+                );
+            }
+        }
     }
 
     #[test]
