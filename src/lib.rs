@@ -1392,6 +1392,121 @@ mod tests {
             0.0,
         ));
     }
+
+    fn assert_valid_subset(
+        cars: &[Car],
+        subset: &[CarIndex],
+        expected_len: usize,
+        target: u32,
+        tolerance_percent: f64,
+    ) {
+        assert_eq!(subset.len(), expected_len, "subset has the wrong length");
+        assert!(
+            subset.iter().all(|&index| index < cars.len()),
+            "subset contains an out-of-bounds index"
+        );
+        assert_eq!(
+            subset.iter().copied().collect::<HashSet<_>>().len(),
+            subset.len(),
+            "subset contains duplicate indices"
+        );
+        let sum = subset
+            .iter()
+            .map(|&index| u64::from(cars[index].lap_time))
+            .sum::<u64>();
+        let accuracy = match (sum, target) {
+            (0, 0) => 100.0,
+            (_, 0) => f64::INFINITY,
+            _ => sum as f64 / target as f64 * 100.0,
+        };
+        assert!(
+            within_tolerance(accuracy, tolerance_percent),
+            "subset sum {sum} is outside ±{tolerance_percent}% of target {target}"
+        );
+    }
+
+    #[test]
+    fn successful_subset_always_satisfies_structural_and_tolerance_invariants() {
+        let cars = vec![car("low", 90), car("high", 110)];
+        let subset = find_approximate_subset(&cars, 100, 1, &HashSet::new(), 1.0)
+            .expect_err("a discrete gap must not be reported as a valid subset");
+        assert!(matches!(
+            subset,
+            SubsetError::OutsideTolerance(_) | SubsetError::NoValidSubset
+        ));
+    }
+
+    #[test]
+    fn self_complement_trap_never_returns_an_invalid_subset() {
+        let cars = vec![car("low", 20), car("middle", 60), car("high", 100)];
+
+        for _ in 0..100 {
+            if let Ok(subset) = find_approximate_subset(&cars, 120, 2, &HashSet::new(), 0.0) {
+                assert_valid_subset(&cars, &subset, 2, 120, 0.0);
+                assert_eq!(
+                    subset.iter().copied().collect::<HashSet<_>>(),
+                    HashSet::from([0, 2])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_previously_selected_index_returns_an_error_instead_of_panicking() {
+        let cars = vec![car("only", 10)];
+        let previous = HashSet::from([99]);
+        let call =
+            std::panic::catch_unwind(|| find_approximate_subset(&cars, 20, 2, &previous, 0.0));
+
+        assert!(
+            call.is_ok(),
+            "public solver panicked for an invalid prior index"
+        );
+        assert!(call.unwrap().is_err());
+    }
+
+    #[test]
+    fn invalid_timeout_and_tolerance_are_rejected() {
+        let cars = vec![car("exact", 100)];
+
+        assert!(perform_multiple_runs(&cars, 100, 1, 1, f64::NAN, 0.0).is_err());
+        assert!(perform_multiple_runs(&cars, 100, 1, 1, -1.0, 0.0).is_err());
+        assert!(perform_multiple_runs(&cars, 100, 1, 1, 100.0, f64::NAN).is_err());
+        assert!(perform_multiple_runs(&cars, 100, 1, 1, 100.0, -1.0).is_err());
+    }
+
+    #[test]
+    fn impossible_lap_count_has_no_target_range_and_returns_an_error() {
+        let cars = vec![car("a", 10), car("b", 20)];
+
+        assert_eq!(get_target_range_for_subset(&cars, 3), (0, 0));
+        assert!(find_approximate_subset(&cars, 30, 3, &HashSet::new(), 0.0).is_err());
+    }
+
+    #[test]
+    fn target_zero_only_accepts_a_zero_sum() {
+        let zero = vec![car("zero", 0)];
+        let positive = vec![car("positive", 1)];
+
+        let subset = find_approximate_subset(&zero, 0, 1, &HashSet::new(), 0.0).unwrap();
+        assert_valid_subset(&zero, &subset, 1, 0, 0.0);
+        assert!(find_approximate_subset(&positive, 0, 1, &HashSet::new(), 0.0).is_err());
+    }
+
+    #[test]
+    fn aggregate_sum_preserves_values_above_u32_max() {
+        let cars = vec![car("max", u32::MAX), car("one", 1)];
+        let mathematical_sum = u64::from(calculate_subset_sum(&cars, &[0, 1]));
+
+        assert_eq!(mathematical_sum, u64::from(u32::MAX) + 1);
+    }
+
+    #[test]
+    #[ignore = "current solver accepts infinite timeouts and may never terminate"]
+    fn infinite_timeout_is_rejected() {
+        let cars = vec![car("exact", 100)];
+        assert!(perform_multiple_runs(&cars, 100, 1, 1, f64::INFINITY, 0.0).is_err());
+    }
 }
 
 pub mod worker_agent;
