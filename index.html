@@ -8,15 +8,20 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-  <!-- Use data-trunk to ensure CSS is included in the build -->
   <link data-trunk rel="css" href="style/main.css" />
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.9/dist/chart.umd.min.js"
+    integrity="sha384-b0GXujLkk9eYYSmcSfoyZbfyElGAQnDyY0skCHSG6w3JgTMFnz11ggrTAr7seu9f"
+    crossorigin="anonymous"></script>
 </head>
 
 <body>
   <div id="root"></div>
-  <link data-trunk rel="rust" href="Cargo.toml" data-bin="random_karma" data-type="main" />
-  <link data-trunk rel="rust" href="Cargo.toml" data-bin="worker" data-type="worker" />
+  <link data-trunk rel="rust" href="Cargo.toml" data-bin="random_karma" data-type="main"
+    data-wasm-opt="z"
+    data-wasm-opt-params="--enable-bulk-memory-opt --enable-nontrapping-float-to-int" />
+  <link data-trunk rel="rust" href="Cargo.toml" data-bin="worker" data-type="worker"
+    data-wasm-opt="z"
+    data-wasm-opt-params="--enable-bulk-memory-opt --enable-nontrapping-float-to-int" />
 </body>
 
 </html>

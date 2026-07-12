@@ -4,12 +4,11 @@
 use futures::StreamExt;
 use gloo_timers::callback::Timeout;
 use random_karma::{
-    get_target_range_for_subset,
-    read_cars_from_csv_string,
-    format_ms_to_minsecms,
-    worker_agent::{KarmaArgs, KarmaTask},
+    format_ms_to_minsecms, get_target_range_for_subset, read_cars_from_csv_string,
+    worker_agent::{KarmaArgs, KarmaResult, KarmaTask, RequestMetadata},
     Car,
 };
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use web_sys::HtmlInputElement;
 use yew::prelude::*;
@@ -22,37 +21,34 @@ mod components;
 mod config; // Add this line
 mod utils;
 
-use cache::CACHE_STORE;
+use cache::{CacheKey, CacheValue, CACHE_STORE};
 use chart::{add_failed_target_marker, add_similarity_data, init_similarity_chart};
-use components::render_results;
+use components::ResultsWrapper;
 use config::*; // This will bring SLIDER_MAX_INDEX and other config constants into scope
 use utils::{
-    base_target_range,
-    base_target_step,
-    calc_cached_count,
-    calc_target_from_idx,
-    parse_time_to_ms,
-    spread_indices,
+    base_target_range, base_target_step, calc_target_from_idx, parse_time_to_ms, spread_indices,
 };
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Type aliases for better readability
-type CacheKey = (u32, usize, usize); // (target_ms, lap_count, player_count)
-type CacheValue = (Vec<Vec<usize>>, f64, u32); // (results, similarity, calculated_target)
+// Fixed because `available_parallelism` cannot be evaluated in a const. Workers
+// are browser-hosted, so a portable conservative pool is preferable here.
+const WORKER_COUNT: usize = 4;
 
-// Get optimal worker count once
-const WORKER_COUNT: usize = {
-    #[cfg(target_arch = "wasm32")]
-    {
-        4 // Default for WASM since we can't call web APIs in const context
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    }
-};
+fn cache_key(metadata: &RequestMetadata) -> CacheKey {
+    CacheKey::new(
+        metadata.dataset_generation,
+        metadata.target,
+        metadata.lap_count,
+        metadata.player_count,
+        metadata.tolerance_percent,
+        metadata.timeout_ms,
+    )
+}
+
+fn next_request_id(request_ids: &Rc<Cell<u64>>) -> u64 {
+    let next = request_ids.get().wrapping_add(1);
+    request_ids.set(next);
+    next
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Helper functions
@@ -82,73 +78,111 @@ fn update_cache_version(cache_version: &UseStateHandle<usize>) {
     cache_version.set(cache_version.wrapping_add(1));
 }
 
-/// Process a single pre-cache target
-async fn process_precache_target(
-    bridge: &mut (impl futures::Stream<Item = Result<(Vec<Vec<usize>>, f64, u32, usize, usize), String>>
-              + futures::Sink<KarmaArgs>
-              + Unpin),
-    args: KarmaArgs,
+struct PrecacheConfig {
+    cars: Vec<Car>,
+    lap_count: usize,
+    player_count: usize,
+    timeout_secs: f64,
+    tolerance_percent: f64,
+}
+
+#[derive(Clone)]
+struct PrecacheExecutionContext {
     cache_version: UseStateHandle<usize>,
-    precache_error_count: UseStateHandle<usize>,
-    precache_failed_targets: UseStateHandle<Rc<Vec<u32>>>,
+    error_count: UseStateHandle<usize>,
+    failed_targets: UseStateHandle<Rc<Vec<u32>>>,
+    dataset_generation: Rc<Cell<u64>>,
+    expected_dataset_generation: u64,
+    precache_generation: Rc<Cell<u64>>,
+    expected_precache_generation: u64,
+}
+
+struct PrecacheJob {
+    config: PrecacheConfig,
+    context: PrecacheExecutionContext,
+    request_ids: Rc<Cell<u64>>,
+}
+
+/// Process a single pre-cache target, ignoring a response after its generation
+/// has been superseded. `Rc<Cell<_>>` remains live across Yew renders.
+async fn process_precache_target(
+    bridge: &mut (impl futures::Stream<Item = KarmaResult> + futures::Sink<KarmaArgs> + Unpin),
+    args: KarmaArgs,
+    context: &PrecacheExecutionContext,
 ) -> Result<(), ()> {
-    let target_val = args.target;
-    let ss = args.lap_count;
-    let nr = args.player_count;
+    let metadata = args.metadata.clone();
+    if context.dataset_generation.get() != context.expected_dataset_generation
+        || context.precache_generation.get() != context.expected_precache_generation
+    {
+        return Err(());
+    }
 
     use futures::SinkExt;
     bridge.send(args).await.map_err(|_| ())?;
-
-    match bridge
-        .next()
-        .await
-        .unwrap_or_else(|| Err("worker closed".into()))
+    let response = bridge.next().await.ok_or(())?;
+    if context.dataset_generation.get() != context.expected_dataset_generation
+        || context.precache_generation.get() != context.expected_precache_generation
     {
-        Ok((res, sim, calc_target, ss_ret, nr_ret)) => {
-            add_similarity_data(calc_target, sim * 100.0, ss as u32, nr as u32);
+        return Err(());
+    }
+
+    match response {
+        Ok(success) if success.metadata == metadata => {
+            add_similarity_data(
+                success.calculated_target,
+                success.similarity * 100.0,
+                metadata.lap_count as u32,
+                metadata.player_count as u32,
+            );
             CACHE_STORE.with(|c| {
-                c.borrow_mut()
-                    .insert((calc_target, ss_ret, nr_ret), (res, sim, calc_target));
+                c.borrow_mut().insert(
+                    cache_key(&metadata),
+                    (success.sets, success.similarity, success.calculated_target),
+                );
             });
-            update_cache_version(&cache_version);
+            update_cache_version(&context.cache_version);
             Ok(())
         }
-        Err(_) => {
-            add_failed_target_marker(target_val, ss as u32, nr as u32);
-            precache_error_count.set(*precache_error_count + 1);
-            let mut failed = (*precache_failed_targets).to_vec();
-            failed.push(target_val);
-            precache_failed_targets.set(Rc::new(failed));
+        Err(failure) if failure.metadata == metadata => {
+            add_failed_target_marker(
+                metadata.target,
+                metadata.lap_count as u32,
+                metadata.player_count as u32,
+            );
+            context.error_count.set(*context.error_count + 1);
+            let mut failed = (*context.failed_targets).to_vec();
+            failed.push(metadata.target);
+            context.failed_targets.set(Rc::new(failed));
             Err(())
         }
+        _ => Err(()),
     }
 }
 
-/// Run pre-cache for a range of targets
-fn run_precache(
-    cars: Vec<Car>,
-    ss: usize,
-    nr: usize,
-    timeout_secs: f64,
-    tolerance_val: f64,
-    cache_version: UseStateHandle<usize>,
-    precache_error_count: UseStateHandle<usize>,
-    precache_failed_targets: UseStateHandle<Rc<Vec<u32>>>,
-    current_token: u32,
-    token_ref: UseStateHandle<u32>,
-) {
-    let (min, max) = get_target_range_for_subset(&cars, ss);
+/// Run pre-cache for a range of targets.
+fn run_precache(job: PrecacheJob) {
+    let PrecacheJob {
+        config,
+        context,
+        request_ids,
+    } = job;
+    let PrecacheConfig {
+        cars,
+        lap_count,
+        player_count,
+        timeout_secs,
+        tolerance_percent,
+    } = config;
+    let (min, max) = get_target_range_for_subset(&cars, lap_count);
     let step = base_target_step(min, max);
     let order = Rc::new(spread_indices(SLIDER_MAX_INDEX + 1));
 
     // Spawn task for each worker
     for worker_idx in 0..WORKER_COUNT {
-        let cars_loop = cars.clone();
-        let token_ref = token_ref.clone();
-        let cache_version = cache_version.clone();
+        let cars = cars.clone();
+        let context = context.clone();
+        let request_ids = request_ids.clone();
         let order = order.clone();
-        let precache_error_count = precache_error_count.clone();
-        let precache_failed_targets = precache_failed_targets.clone();
 
         wasm_bindgen_futures::spawn_local(async move {
             let mut bridge = <KarmaTask as Spawnable>::spawner().spawn(WORKER_SCRIPT);
@@ -156,36 +190,35 @@ fn run_precache(
             for pos in (worker_idx..order.len()).step_by(WORKER_COUNT) {
                 let idx = order[pos];
 
-                // Check if we should stop
-                if *token_ref != current_token {
+                // Stop promptly when the dataset or pre-cache job changes.
+                if context.dataset_generation.get() != context.expected_dataset_generation
+                    || context.precache_generation.get() != context.expected_precache_generation
+                {
                     return;
                 }
 
-                let target_val = (min + step * idx as u32).min(max);
-                let key: CacheKey = (target_val, ss, nr);
+                let target = (min + step * idx as u32).min(max);
+                let metadata = RequestMetadata {
+                    request_id: next_request_id(&request_ids),
+                    dataset_generation: context.expected_dataset_generation,
+                    target,
+                    lap_count,
+                    player_count,
+                    timeout_ms: timeout_secs * 1000.0,
+                    tolerance_percent,
+                };
+                let key = cache_key(&metadata);
 
-                // Skip if already cached
                 if CACHE_STORE.with(|c| c.borrow().contains_key(&key)) {
                     continue;
                 }
 
                 let args = KarmaArgs {
-                    cars: cars_loop.clone(),
-                    target: target_val,
-                    lap_count: ss,
-                    player_count: nr,
-                    timeout_ms: timeout_secs * 1000.0,
-                    tolerance_percent: tolerance_val,
+                    cars: cars.clone(),
+                    metadata,
                 };
 
-                let _ = process_precache_target(
-                    &mut bridge,
-                    args,
-                    cache_version.clone(),
-                    precache_error_count.clone(),
-                    precache_failed_targets.clone(),
-                )
-                .await;
+                let _ = process_precache_target(&mut bridge, args, &context).await;
             }
         });
     }
@@ -220,8 +253,11 @@ fn main_component() -> Html {
     let last_from_cache = use_state(|| false);
     // Debounce timer handle - simplified to use UseStateHandle
     let debounce_timer = use_state(|| None::<Timeout>);
-    // Pre-cache control state - using simple counter instead of mutable ref
-    let precache_token = use_state(|| 0u32);
+    // Live shared tokens let asynchronous work observe cancellation after a Yew render.
+    let dataset_generation = use_state(|| Rc::new(Cell::new(0u64)));
+    let precache_generation = use_state(|| Rc::new(Cell::new(0u64)));
+    let request_ids = use_state(|| Rc::new(Cell::new(0u64)));
+    let active_request = use_state(|| Rc::new(RefCell::new(None::<RequestMetadata>)));
     let debounce_precache = use_state(|| None::<Timeout>);
     // State to track pre-cache errors for the current parameters
     let precache_error_count = use_state(|| 0usize);
@@ -237,9 +273,11 @@ fn main_component() -> Html {
 
     // Remove worker_count state - use constant instead
     // slider index state (0..SLIDER_MAX_INDEX)
-    let slider_idx = use_state(|| 0usize);
+    let slider_idx = use_state(|| 0);
+    let clipboard_feedback = use_state(|| None::<String>);
+    let copy_feedback = use_state(|| None::<String>);
 
-    // Validation error states only (no text states or dirty flags)
+    // Text input validation states
     let lap_count_error = use_state(|| None::<String>);
     let player_count_error = use_state(|| None::<String>);
     let target_error = use_state(|| None::<String>);
@@ -287,7 +325,7 @@ fn main_component() -> Html {
     {
         let cars = cars.clone();
         use_effect_with((), move |_| {
-            let loaded = read_cars_from_csv_string(csv_data, 1, 3, 4).unwrap_or_default();
+            let loaded = read_cars_from_csv_string(csv_data).unwrap_or_default();
             cars.set(loaded);
         });
     }
@@ -305,6 +343,9 @@ fn main_component() -> Html {
         let results = results.clone();
         let error_message = error_message.clone();
         let is_calculating = is_calculating.clone();
+        let dataset_generation = dataset_generation.clone();
+        let request_ids = request_ids.clone();
+        let active_request = active_request.clone();
         Callback::from(move |target_override: Option<u32>| {
             let target_to_use = target_override.unwrap_or(*target_state);
             let lap_count = *lap_count_state;
@@ -314,9 +355,19 @@ fn main_component() -> Html {
 
             is_calculating.set(true);
 
-            let key: CacheKey = (target_to_use, lap_count, player_count);
+            let metadata = RequestMetadata {
+                request_id: next_request_id(&request_ids),
+                dataset_generation: dataset_generation.get(),
+                target: target_to_use,
+                lap_count,
+                player_count,
+                timeout_ms: timeout_value * 1000.0,
+                tolerance_percent: tolerance_value,
+            };
+            let key = cache_key(&metadata);
 
             if let Some(cached) = CACHE_STORE.with(|c| c.borrow().get(&key).cloned()) {
+                *active_request.borrow_mut() = None;
                 last_from_cache.set(true);
                 results.set(Some(cached));
                 error_message.set(None);
@@ -324,13 +375,10 @@ fn main_component() -> Html {
                 return;
             }
 
+            *active_request.borrow_mut() = Some(metadata.clone());
             let args = KarmaArgs {
                 cars: (*cars_state).clone(),
-                target: target_to_use,
-                lap_count,
-                player_count,
-                timeout_ms: timeout_value * 1000.0,
-                tolerance_percent: tolerance_value,
+                metadata,
             };
             karma_sub.send(args);
             is_calculating.set(true);
@@ -374,7 +422,8 @@ fn main_component() -> Html {
         );
     }
 
-    // Debounced pre-cache effect - simplified
+    // A change to every pre-cache input, including enabled state and dataset,
+    // invalidates both queued and in-flight work through the live token.
     use_effect_with(
         (
             *lap_count,
@@ -382,47 +431,62 @@ fn main_component() -> Html {
             cars.len(),
             *timeout_seconds,
             *tolerance_percent,
+            *precache_enabled,
             *precache_trigger,
+            dataset_generation.get(),
         ),
         {
             let cars = cars.clone();
-            let precache_enabled = precache_enabled.clone();
             let precache_error_count = precache_error_count.clone();
             let precache_failed_targets = precache_failed_targets.clone();
             let cache_version = cache_version.clone();
-            let precache_token = precache_token.clone();
+            let precache_generation = precache_generation.clone();
+            let dataset_generation = dataset_generation.clone();
+            let request_ids = request_ids.clone();
             let debounce_precache = debounce_precache.clone();
 
-            move |&(ss, nr, car_count, timeout_secs, tolerance_val, _trigger)| -> Box<dyn FnOnce()> {
-                if !*precache_enabled || car_count == 0 {
+            move |&(
+                ss,
+                nr,
+                car_count,
+                timeout_secs,
+                tolerance_val,
+                enabled,
+                _trigger,
+                dataset_id,
+            )|
+                  -> Box<dyn FnOnce()> {
+                debounce_precache.set(None);
+                let generation = precache_generation.get().wrapping_add(1);
+                (*precache_generation).set(generation);
+
+                if !enabled || car_count == 0 {
                     return Box::new(|| ());
                 }
 
-                // Cancel pending timer and bump token
-                debounce_precache.set(None);
-                precache_token.set(*precache_token + 1);
-                let current_token = *precache_token;
-
-                // Reset error count and failed targets for the new parameters
                 precache_error_count.set(0);
                 precache_failed_targets.set(Rc::new(Vec::new()));
-
-                // Run pre-cache immediately
                 let handle = Timeout::new(0, move || {
-                    run_precache(
-                        (*cars).clone(),
-                        ss,
-                        nr,
-                        timeout_secs,
-                        tolerance_val,
-                        cache_version,
-                        precache_error_count,
-                        precache_failed_targets,
-                        current_token,
-                        precache_token,
-                    );
+                    run_precache(PrecacheJob {
+                        config: PrecacheConfig {
+                            cars: (*cars).clone(),
+                            lap_count: ss,
+                            player_count: nr,
+                            timeout_secs,
+                            tolerance_percent: tolerance_val,
+                        },
+                        context: PrecacheExecutionContext {
+                            cache_version,
+                            error_count: precache_error_count,
+                            failed_targets: precache_failed_targets,
+                            dataset_generation: (*dataset_generation).clone(),
+                            expected_dataset_generation: dataset_id,
+                            precache_generation: (*precache_generation).clone(),
+                            expected_precache_generation: generation,
+                        },
+                        request_ids: (*request_ids).clone(),
+                    });
                 });
-
                 debounce_precache.set(Some(handle));
                 Box::new(|| ())
             }
@@ -444,7 +508,24 @@ fn main_component() -> Html {
         let nr = *player_count;
         let (min, max) = base_target_range(&cars_vec, ss);
         let step = base_target_step(min, max);
-        calc_cached_count(min, max, step, ss, nr)
+        let dataset_id = dataset_generation.get();
+        let timeout_ms = *timeout_seconds * 1000.0;
+        CACHE_STORE.with(|c| {
+            (0..=SLIDER_MAX_INDEX)
+                .filter(|idx| {
+                    let metadata = RequestMetadata {
+                        request_id: 0,
+                        dataset_generation: dataset_id,
+                        target: (min + step * *idx as u32).min(max),
+                        lap_count: ss,
+                        player_count: nr,
+                        timeout_ms,
+                        tolerance_percent: *tolerance_percent,
+                    };
+                    c.borrow().contains_key(&cache_key(&metadata))
+                })
+                .count()
+        })
     };
 
     // (re-)initialise the chart on lap_count or player_count changes, and replay cache
@@ -452,89 +533,115 @@ fn main_component() -> Html {
         let lap_handle = lap_count.clone();
         let player_handle = player_count.clone();
         let cars = cars.clone();
-        use_effect_with((*lap_count, *player_count, cars.len()), move |&_| {
-            let lap_count_val = *lap_handle as u32;
-            let player_count_val = *player_handle as u32;
-            let (min, max) = base_target_range(&cars, *lap_handle as usize);
-            if max > min {
-                init_similarity_chart(min, max, lap_count_val, player_count_val);
+        let dataset_generation = dataset_generation.clone();
+        let timeout_seconds = timeout_seconds.clone();
+        let tolerance_percent = tolerance_percent.clone();
+        use_effect_with(
+            (
+                *lap_count,
+                *player_count,
+                cars.len(),
+                dataset_generation.get(),
+                *timeout_seconds,
+                *tolerance_percent,
+                *cache_version,
+            ),
+            move |_| {
+                let lap_count_val = *lap_handle as u32;
+                let player_count_val = *player_handle as u32;
+                let (min, max) = base_target_range(&cars, *lap_handle as usize);
+                if max > min {
+                    init_similarity_chart(min, max, lap_count_val, player_count_val);
 
-                // replay any existing cache entries for this lap_count/player_count
-                let ss = lap_count_val as usize;
-                let nr = player_count_val as usize;
-                CACHE_STORE.with(|c| {
-                    let mut entries: Vec<(u32, f64)> = c
-                        .borrow()
-                        .iter()
-                        .filter(|((_, s, r), _)| *s == ss && *r == nr)
-                        .map(|((t, _, _), (_sets, sim, _calc))| (*t, *sim))
-                        .collect();
-                    entries.sort_by_key(|(t, _)| *t);
-                    for (t, sim) in entries {
-                        add_similarity_data(t, sim * 100.0, lap_count_val, player_count_val);
-                    }
-                });
-            }
-            || ()
-        });
+                    // replay any existing cache entries for this lap_count/player_count
+                    let ss = lap_count_val as usize;
+                    let nr = player_count_val as usize;
+                    CACHE_STORE.with(|c| {
+                        let mut entries: Vec<(u32, f64)> = c
+                            .borrow()
+                            .iter()
+                            .filter(|(key, _)| {
+                                key.dataset_generation == dataset_generation.get()
+                                    && key.lap_count == ss
+                                    && key.player_count == nr
+                                    && key.timeout_ms_bits == (*timeout_seconds * 1000.0).to_bits()
+                                    && key.tolerance_percent_bits == (*tolerance_percent).to_bits()
+                            })
+                            .map(|(key, (_sets, sim, _calc))| (key.target_ms, *sim))
+                            .collect();
+                        entries.sort_by_key(|(t, _)| *t);
+                        for (t, sim) in entries {
+                            add_similarity_data(t, sim * 100.0, lap_count_val, player_count_val);
+                        }
+                    });
+                }
+                || ()
+            },
+        );
     }
 
     // effect that consumes new worker messages
     {
         let karma_sub_consumer = karma_sub.clone();
         let handled_idx = handled_idx.clone();
-        let lap_count = lap_count.clone();
-        let player_count = player_count.clone();
         let cache_version = cache_version.clone();
         let last_from_cache = last_from_cache.clone();
         let results = results.clone();
         let error_message = error_message.clone();
-        let target_state = target.clone();
+        let dataset_generation = dataset_generation.clone();
+        let active_request = active_request.clone();
         let is_calculating_cb = is_calculating.clone();
         use_effect_with(karma_sub.len(), move |_| {
             let all = karma_sub_consumer.iter();
             let new_total = all.len();
             for msg in all.skip(*handled_idx.borrow()) {
                 match msg.as_ref() {
-                    Ok((sets, sim, calc_target, ss_ret, nr_ret)) => {
-                        // only plot if the message belongs to the *current* subset/runs
-                        if *ss_ret == *lap_count && *nr_ret == *player_count {
-                            add_similarity_data(
-                                *calc_target,
-                                *sim * 100.0,
-                                *lap_count as u32,
-                                *player_count as u32,
-                            );
-                        }
-
-                        let key: CacheKey = (*calc_target, *ss_ret, *nr_ret);
+                    Ok(success)
+                        if success.metadata.dataset_generation == dataset_generation.get()
+                            && active_request.borrow().as_ref() == Some(&success.metadata) =>
+                    {
+                        add_similarity_data(
+                            success.calculated_target,
+                            success.similarity * 100.0,
+                            success.metadata.lap_count as u32,
+                            success.metadata.player_count as u32,
+                        );
                         CACHE_STORE.with(|c| {
-                            c.borrow_mut()
-                                .insert(key, (sets.clone(), *sim, *calc_target));
+                            c.borrow_mut().insert(
+                                cache_key(&success.metadata),
+                                (
+                                    success.sets.clone(),
+                                    success.similarity,
+                                    success.calculated_target,
+                                ),
+                            );
                         });
                         update_cache_version(&cache_version);
-
-                        // show the result only if it matches the current selection
-                        if *ss_ret == *lap_count
-                            && *nr_ret == *player_count
-                            && *calc_target == *target_state
-                        {
-                            last_from_cache.set(false);
-                            results.set(Some((sets.clone(), *sim, *calc_target)));
-                            error_message.set(None);
-                            is_calculating_cb.set(false);
-                        }
-                    }
-                    Err(e) => {
-                        add_failed_target_marker(
-                            *target_state,
-                            *lap_count as u32,
-                            *player_count as u32,
-                        );
-                        results.set(None);
-                        error_message.set(Some(e.clone()));
+                        *active_request.borrow_mut() = None;
+                        last_from_cache.set(false);
+                        results.set(Some((
+                            success.sets.clone(),
+                            success.similarity,
+                            success.calculated_target,
+                        )));
+                        error_message.set(None);
                         is_calculating_cb.set(false);
                     }
+                    Err(failure)
+                        if failure.metadata.dataset_generation == dataset_generation.get()
+                            && active_request.borrow().as_ref() == Some(&failure.metadata) =>
+                    {
+                        add_failed_target_marker(
+                            failure.metadata.target,
+                            failure.metadata.lap_count as u32,
+                            failure.metadata.player_count as u32,
+                        );
+                        *active_request.borrow_mut() = None;
+                        results.set(None);
+                        error_message.set(Some(failure.error.clone()));
+                        is_calculating_cb.set(false);
+                    }
+                    _ => {}
                 }
             }
             *handled_idx.borrow_mut() = new_total;
@@ -821,11 +928,148 @@ fn main_component() -> Html {
         });
     }
 
+    let handle_paste_from_clipboard = {
+        let cars_setter = cars.clone();
+        let feedback_setter = clipboard_feedback.clone();
+        let results = results.clone();
+        let error_message = error_message.clone();
+        let is_calculating = is_calculating.clone();
+        let active_request = active_request.clone();
+        let dataset_generation = dataset_generation.clone();
+        let precache_generation = precache_generation.clone();
+        let cache_version = cache_version.clone();
+
+        Callback::from(move |_: MouseEvent| {
+            let cars_setter = cars_setter.clone();
+            let feedback_setter = feedback_setter.clone();
+            let results = results.clone();
+            let error_message = error_message.clone();
+            let is_calculating = is_calculating.clone();
+            let active_request = active_request.clone();
+            let dataset_generation = dataset_generation.clone();
+            let precache_generation = precache_generation.clone();
+            let cache_version = cache_version.clone();
+
+            wasm_bindgen_futures::spawn_local(async move {
+                let window = web_sys::window().expect("no global `window` exists");
+                let navigator = window.navigator();
+                let clipboard = navigator.clipboard();
+
+                match wasm_bindgen_futures::JsFuture::from(clipboard.read_text()).await {
+                    Ok(text) => {
+                        if let Some(text_str) = text.as_string() {
+                            if text_str.trim().is_empty() {
+                                feedback_setter.set(Some("Clipboard is empty.".to_string()));
+                                return;
+                            }
+                            match read_cars_from_csv_string(&text_str) {
+                                Ok(new_cars) => {
+                                    if new_cars.is_empty() {
+                                        feedback_setter.set(Some(
+                                            "No valid car data found in clipboard content."
+                                                .to_string(),
+                                        ));
+                                    } else {
+                                        let car_count = new_cars.len();
+                                        // New rows invalidate every old index and all in-flight work.
+                                        (*dataset_generation)
+                                            .set(dataset_generation.get().wrapping_add(1));
+                                        (*precache_generation)
+                                            .set(precache_generation.get().wrapping_add(1));
+                                        *active_request.borrow_mut() = None;
+                                        CACHE_STORE.with(|c| c.borrow_mut().clear());
+                                        update_cache_version(&cache_version);
+                                        results.set(None);
+                                        error_message.set(None);
+                                        is_calculating.set(false);
+                                        cars_setter.set(new_cars);
+                                        feedback_setter.set(Some(format!(
+                                            "Successfully loaded {} cars from clipboard.",
+                                            car_count
+                                        )));
+                                    }
+                                }
+                                Err(e) => {
+                                    feedback_setter.set(Some(format!(
+                                        "Failed to parse clipboard content: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        } else {
+                            feedback_setter.set(Some("Failed to read clipboard text.".to_string()));
+                        }
+                    }
+                    Err(_) => {
+                        feedback_setter.set(Some(
+                            "Failed to read from clipboard. Check browser permissions.".to_string(),
+                        ));
+                    }
+                }
+            });
+        })
+    };
+
+    let handle_copy_results_to_clipboard = {
+        let cars = cars.clone();
+        let results = results.clone();
+        let feedback_setter = copy_feedback.clone();
+
+        Callback::from(move |_: MouseEvent| {
+            let feedback_setter = feedback_setter.clone();
+            let cars = cars.clone();
+            let results = results.clone();
+
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Some((result_sets, _, _)) = results.as_ref() {
+                    if result_sets.is_empty() {
+                        feedback_setter.set(Some("No results to copy.".to_string()));
+                        return;
+                    }
+
+                    let csv_content = result_sets
+                        .iter()
+                        .filter_map(|car_indices| {
+                            let row = car_indices
+                                .iter()
+                                .filter_map(|&index| cars.get(index).map(|car| car.id.clone()))
+                                .collect::<Vec<String>>();
+                            (!row.is_empty()).then(|| row.join(","))
+                        })
+                        .collect::<Vec<String>>()
+                        .join("\n");
+                    if csv_content.is_empty() {
+                        feedback_setter
+                            .set(Some("Results contain no valid cars to copy.".to_string()));
+                        return;
+                    }
+
+                    let window = web_sys::window().expect("no global `window` exists");
+                    let navigator = window.navigator();
+                    match wasm_bindgen_futures::JsFuture::from(
+                        navigator.clipboard().write_text(&csv_content),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            feedback_setter.set(Some("Results copied to clipboard!".to_string()));
+                        }
+                        Err(_) => {
+                            feedback_setter
+                                .set(Some("Failed to copy. Check permissions.".to_string()));
+                        }
+                    }
+                } else {
+                    feedback_setter.set(Some("No results available to copy.".to_string()));
+                }
+            });
+        })
+    };
+
     html! {
         <div class="container">
             <h1>{ "Random Karma Configuration" }</h1>
 
-            // Top Control Bar section - Lap Count & Player Count
             <div class="top-controls">
                 <div class="form-group">
                     <label for="lap_count_text_input">{ "Lap Count:" }</label>
@@ -836,10 +1080,19 @@ fn main_component() -> Html {
                             value={lap_count.to_string()}
                             oninput={
                                 let lap_count_setter = lap_count.clone();
+                                let calculate = calculate.clone();
+                                let debounce_timer = debounce_timer.clone();
+                                let active_request = active_request.clone();
+                                let results = results.clone();
+                                let error_message = error_message.clone();
                                 Callback::from(move |e: InputEvent| {
                                     let input: HtmlInputElement = e.target_unchecked_into();
                                     if let Ok(val) = input.value().parse::<usize>() {
                                         lap_count_setter.set(val);
+                                        *active_request.borrow_mut() = None;
+                                        results.set(None);
+                                        error_message.set(None);
+                                        debounce_callback(&debounce_timer, calculate.clone(), None, DEBOUNCE_MS);
                                     }
                                 })
                             }
@@ -872,10 +1125,19 @@ fn main_component() -> Html {
                             value={player_count.to_string()}
                             oninput={
                                 let player_count_setter = player_count.clone();
+                                let calculate = calculate.clone();
+                                let debounce_timer = debounce_timer.clone();
+                                let active_request = active_request.clone();
+                                let results = results.clone();
+                                let error_message = error_message.clone();
                                 Callback::from(move |e: InputEvent| {
                                     let input: HtmlInputElement = e.target_unchecked_into();
                                     if let Ok(val) = input.value().parse::<usize>() {
                                         player_count_setter.set(val);
+                                        *active_request.borrow_mut() = None;
+                                        results.set(None);
+                                        error_message.set(None);
+                                        debounce_callback(&debounce_timer, calculate.clone(), None, DEBOUNCE_MS);
                                     }
                                 })
                             }
@@ -922,11 +1184,17 @@ fn main_component() -> Html {
                                     let lap_count_clone = lap_count.clone();
                                     let calculate_cb = calculate.clone();
                                     let debounce_timer_cb = debounce_timer.clone();
+                                    let active_request = active_request.clone();
+                                    let results = results.clone();
+                                    let error_message = error_message.clone();
 
                                     Callback::from(move |e: InputEvent| {
                                         let input: HtmlInputElement = e.target_unchecked_into();
                                         if let Ok(val) = input.value().parse::<u32>() {
                                             target_setter.set(val);
+                                            *active_request.borrow_mut() = None;
+                                            results.set(None);
+                                            error_message.set(None);
                                             // Update slider_idx based on new target value
                                             let (min_target, max_target) = base_target_range(&cars_clone, *lap_count_clone);
                                             let range = max_target - min_target;
@@ -964,7 +1232,7 @@ fn main_component() -> Html {
                         aria-expanded={(*cache_settings_visible).to_string()}
                         onclick={
                             let cache_settings_visible = cache_settings_visible.clone();
-                            Callback::from(move |_| {
+                            Callback::from(move |_: MouseEvent| {
                                 cache_settings_visible.set(!*cache_settings_visible);
                             })
                         }
@@ -990,6 +1258,14 @@ fn main_component() -> Html {
 
                 if *cache_settings_visible {
                     <div class="settings-content">
+                        <div class="clipboard-import-section">
+                             <button onclick={handle_paste_from_clipboard} class="button-primary">
+                                { "Paste Car Data from Clipboard" }
+                            </button>
+                            if let Some(feedback) = &*clipboard_feedback {
+                                <div class="clipboard-feedback">{ feedback }</div>
+                            }
+                        </div>
                         <div class="form-group checkbox-group">
                             <label>
                                 <input type="checkbox"
@@ -1067,7 +1343,7 @@ fn main_component() -> Html {
                             let cars = cars.clone(); // Clone the handle
                             let precache_enabled = *precache_enabled; // Capture value
                             let precache_trigger = precache_trigger.clone();
-                            Callback::from(move |_| {
+                            Callback::from(move |_: MouseEvent| {
                                 CACHE_STORE.with(|c| c.borrow_mut().clear());
                                 update_cache_version(&cache_version);
 
@@ -1098,16 +1374,28 @@ fn main_component() -> Html {
             </div>
 
             // Results section
-            <div class="results-area">
-                if let Some((ref all_results, similarity, calculated_target)) = *results {
-                    { render_results(&cars,
-                                    all_results,
-                                    similarity,
-                                    calculated_target) }
-                } else if !*is_calculating {
-                    <div class="no-results-message">
-                        <p>{ "Adjust parameters and wait for calculation results." }</p>
+            <div class="results-section">
+                if *is_calculating {
+                    <div class="loading-indicator">{ "Calculating..." }</div>
+                } else if let Some(ref error) = *error_message {
+                    <div class="error-message">{ error }</div>
+                } else if let Some((sets, sim, calc_target)) = &*results {
+                    <div class="results-header">
+                        <button onclick={handle_copy_results_to_clipboard} class="button-secondary">
+                            { "Copy Results as CSV" }
+                        </button>
+                        if let Some(feedback) = &*copy_feedback {
+                            <div class="copy-feedback">{ feedback }</div>
+                        }
                     </div>
+                    <ResultsWrapper
+                        cars={Rc::new((*cars).clone())}
+                        all_results={Rc::new(sets.clone())}
+                        similarity={*sim}
+                        calculated_target={*calc_target}
+                    />
+                } else {
+                    <div class="no-results-placeholder">{ "Select parameters and find karma" }</div>
                 }
             </div>
         </div>

@@ -1,5 +1,7 @@
 [build]
 release = true
+public_url = "/random-karma/"
+filehash = true
 
 [tools]
-wasm_opt = "version_123"
+wasm_opt = "version_125"

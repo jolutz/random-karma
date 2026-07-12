@@ -1,2 +1,5 @@
-target
-dist
+# Rust build output
+/target/
+
+# Trunk build output
+/dist/

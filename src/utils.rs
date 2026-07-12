@@ -1,6 +1,6 @@
 use crate::config::SLIDER_MAX_INDEX;
 use crate::get_target_range_for_subset;
-use crate::{cache::CACHE_STORE, Car};
+use crate::Car;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::VecDeque;
@@ -68,25 +68,6 @@ pub fn base_target_step(min: u32, max: u32) -> u32 {
 pub fn calc_target_from_idx(min: u32, max: u32, idx: usize) -> u32 {
     let step = base_target_step(min, max);
     (min + step * idx as u32).min(max)
-}
-
-/// Count how many cached entries exist for the given lap_count and player_count parameters.
-pub fn calc_cached_count(
-    min: u32,
-    max: u32,
-    step: u32,
-    lap_count: usize,
-    player_count: usize,
-) -> usize {
-    CACHE_STORE.with(|c| {
-        let map = c.borrow();
-        (0..=SLIDER_MAX_INDEX)
-            .filter(|idx| {
-                let target_val = (min + step * *idx as u32).min(max);
-                map.contains_key(&(target_val, lap_count, player_count))
-            })
-            .count()
-    })
 }
 
 /// Time parsing error types for better error handling

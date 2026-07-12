@@ -7,7 +7,7 @@ const CONFIG = {
 	CHART_ANIMATION: false,
 	SLIDER_WIDTH_BUFFER: 10,
 
-	// Theme colors matching CSS design system
+	// Theme co/lors matching CSS design system
 	COLORS: {
 		primary: '#4361ee',
 		danger: '#f87171',
@@ -118,6 +118,20 @@ function createChartConfig(min, max) {
 			spanGaps: true,
 			responsive: true,
 			maintainAspectRatio: false,
+			onClick: (evt) => {
+				const points = chart.getElementsAtEventForMode(evt, 'point', { intersect: true }, false);
+				if (points.length) {
+					const firstPoint = points[0];
+					const targetTime = chart.data.datasets[firstPoint.datasetIndex].data[firstPoint.index].x;
+
+					const targetSlider = document.querySelector('.target-slider-container input[type="range"]');
+					if (targetSlider) {
+						targetSlider.value = targetTime;
+						// Dispatch an event to notify of the change
+						targetSlider.dispatchEvent(new Event('input', { bubbles: true }));
+					}
+				}
+			},
 			layout: {
 				padding: CONFIG.LAYOUT.padding
 			},

@@ -111,22 +111,49 @@ impl PartialOrd for Car {
 /// Return `sum / target` as a percentage (e.g. 100.0 means perfect hit).
 #[inline]
 pub(crate) fn accuracy_percent(sum: u32, target: u32) -> f64 {
-    sum as f64 / target as f64 * 100.0
+    match target {
+        0 if sum == 0 => 100.0,
+        0 => f64::INFINITY,
+        _ => sum as f64 / target as f64 * 100.0,
+    }
 }
 
 /// Check whether a percentage is inside ±`tolerance_percent`.
 #[inline]
 pub(crate) fn within_tolerance(value_pct: f64, tolerance_percent: f64) -> bool {
+    if !tolerance_percent.is_finite() || tolerance_percent < 0.0 {
+        return false;
+    }
+
     let lower = 100.0 - tolerance_percent;
     let upper = 100.0 + tolerance_percent;
     (lower..=upper).contains(&value_pct)
 }
 
+#[inline]
+fn target_is_reachable(
+    current_sum: u32,
+    min_possible: u32,
+    max_possible: u32,
+    target: u32,
+    tolerance_percent: f64,
+) -> bool {
+    if !tolerance_percent.is_finite() || tolerance_percent < 0.0 {
+        return false;
+    }
+
+    let target = target as f64;
+    let lower_bound = target * (1.0 - tolerance_percent / 100.0);
+    let upper_bound = target * (1.0 + tolerance_percent / 100.0);
+    let min_total = current_sum as f64 + min_possible as f64;
+    let max_total = current_sum as f64 + max_possible as f64;
+
+    min_total <= upper_bound && max_total >= lower_bound
+}
+
 fn handle_last_number(
     cars: &[Car],
     candidates_for_current_selection: &[CarIndex], // Changed from &mut to &
-    previously_selected: &HashSet<CarIndex>,
-    selected: &[CarIndex],
     current_sum: u32,
     target: u32,
     tolerance_percent: f64,
@@ -145,16 +172,8 @@ fn handle_last_number(
         debug!("Last number outside tolerance, calling fallback_strategy");
         // Need to make a mutable copy for fallback_strategy
         let mut candidates_copy: Vec<CarIndex> = candidates_for_current_selection.to_vec();
-        let (fallback_idx, _) = fallback_strategy(
-            cars,
-            &mut candidates_copy,
-            previously_selected,
-            selected,
-            current_sum,
-            false,
-            target,
-            1,
-        );
+        let (fallback_idx, _) =
+            fallback_strategy(cars, &mut candidates_copy, current_sum, target, 1);
         return (fallback_idx, current_sum + get_lap_time(cars, fallback_idx));
     }
 
@@ -216,8 +235,8 @@ fn find_closest_time(cars: &[Car], indexes: &[CarIndex], target_time: u32) -> Ca
 
     // Now we have two candidates: indexes[left] and indexes[right]
     // Return the closer one
-    let left_diff = (get_lap_time(cars, indexes[left]) as i32 - target_time as i32).abs();
-    let right_diff = (get_lap_time(cars, indexes[right]) as i32 - target_time as i32).abs();
+    let left_diff = get_lap_time(cars, indexes[left]).abs_diff(target_time);
+    let right_diff = get_lap_time(cars, indexes[right]).abs_diff(target_time);
 
     if left_diff <= right_diff {
         indexes[left]
@@ -229,10 +248,7 @@ fn find_closest_time(cars: &[Car], indexes: &[CarIndex], target_time: u32) -> Ca
 fn fallback_strategy(
     cars: &[Car],
     candidates_for_current_selection: &mut [CarIndex],
-    previously_selected: &HashSet<CarIndex>,
-    selected: &[CarIndex],
     current_sum: u32,
-    using_previous_cars: bool,
     target: u32,
     remaining_needed: usize,
 ) -> (CarIndex, bool) {
@@ -246,47 +262,18 @@ fn fallback_strategy(
 
     // Sort to find the best match in current pool
     candidates_for_current_selection
-        .sort_by_key(|&idx| (get_lap_time(cars, idx) as i32 - current_target_avg as i32).abs());
+        .sort_by_key(|&idx| get_lap_time(cars, idx).abs_diff(current_target_avg));
     let best_match_idx = candidates_for_current_selection[0];
 
-    // Optionally consider previously selected numbers
-    if !using_previous_cars && !previously_selected.is_empty() {
-        let available_previous: Vec<CarIndex> = previously_selected
-            .iter()
-            .filter(|&&idx| !selected.contains(&idx))
-            .cloned()
-            .collect();
-
-        if !available_previous.is_empty() {
-            let best_previous_idx = *available_previous
-                .iter()
-                .min_by_key(|&&idx| {
-                    (get_lap_time(cars, idx) as i32 - current_target_avg as i32).abs()
-                })
-                .unwrap();
-
-            let best_match_diff =
-                (get_lap_time(cars, best_match_idx) as i32 - current_target_avg as i32).abs();
-            let best_previous_diff =
-                (get_lap_time(cars, best_previous_idx) as i32 - current_target_avg as i32).abs();
-
-            if best_previous_diff < best_match_diff {
-                debug!(
-                    "Using previously selected number {} instead of {} (closer to target avg: {})",
-                    get_lap_time(cars, best_previous_idx),
-                    get_lap_time(cars, best_match_idx),
-                    current_target_avg
-                );
-                return (best_previous_idx, true);
-            }
-        }
-    }
+    // Previously selected cars are added to the candidate pool only when the
+    // unused pool cannot satisfy this selection. Never bypass that pool here.
 
     // Return final chosen car and a flag indicating we used a "backtrack"
     (best_match_idx, true)
 }
 
 fn try_extend_with_previous(
+    cars: &[Car],
     candidate_indexes: &mut Vec<CarIndex>,
     previously_selected: &HashSet<CarIndex>,
     selected: &[CarIndex],
@@ -304,6 +291,8 @@ fn try_extend_with_previous(
         false
     } else {
         candidate_indexes.extend(available_previous);
+        candidate_indexes.sort_unstable_by_key(|&idx| get_lap_time(cars, idx));
+        candidate_indexes.dedup();
         true
     }
 }
@@ -334,12 +323,44 @@ pub fn find_approximate_subset(
     previously_selected: &HashSet<CarIndex>,
     tolerance_percent: f64,
 ) -> Result<Vec<CarIndex>, SubsetError> {
-    let mut rng = rand::rng();
+    let available_indexes: Vec<CarIndex> = (0..cars.len())
+        .filter(|idx| !previously_selected.contains(idx))
+        .collect();
+    find_approximate_subset_from_candidates(
+        cars,
+        target,
+        lap_count,
+        &available_indexes,
+        previously_selected,
+        tolerance_percent,
+    )
+}
 
+fn find_approximate_subset_from_candidates(
+    cars: &[Car],
+    target: u32,
+    lap_count: usize,
+    candidate_indexes: &[CarIndex],
+    previously_selected: &HashSet<CarIndex>,
+    tolerance_percent: f64,
+) -> Result<Vec<CarIndex>, SubsetError> {
+    if !tolerance_percent.is_finite() || tolerance_percent < 0.0 {
+        return Err(SubsetError::NoValidSubset);
+    }
+    if lap_count == 0 {
+        return if within_tolerance(accuracy_percent(0, target), tolerance_percent) {
+            Ok(Vec::new())
+        } else {
+            Err(SubsetError::NoValidSubset)
+        };
+    }
+
+    let mut rng = rand::rng();
     let mut selected = Vec::new();
     let mut current_sum = 0;
-    let mut remaining_indexes: Vec<CarIndex> = (0..cars.len()).collect();
-    remaining_indexes.sort_by_key(|&idx| get_lap_time(cars, idx));
+    let mut remaining_indexes = candidate_indexes.to_vec();
+    remaining_indexes.sort_unstable_by_key(|&idx| get_lap_time(cars, idx));
+    remaining_indexes.dedup();
     let mut total_backtracks = 0;
 
     while selected.len() < lap_count {
@@ -365,6 +386,7 @@ pub fn find_approximate_subset(
             );
             // Check if we have previously selected numbers we could use
             if !try_extend_with_previous(
+                cars,
                 &mut candidates_for_current_selection,
                 previously_selected,
                 &selected,
@@ -398,8 +420,14 @@ pub fn find_approximate_subset(
             min_possible, max_possible, remaining_needed
         );
 
-        // Check if target is still reachable
-        if current_sum + min_possible > target || current_sum + max_possible < target {
+        // Check whether the possible range overlaps the tolerance-adjusted target range.
+        if !target_is_reachable(
+            current_sum,
+            min_possible,
+            max_possible,
+            target,
+            tolerance_percent,
+        ) {
             debug!(
                 "Target {} no longer reachable. Current sum: {}, Range: [{}, {}]",
                 target,
@@ -411,6 +439,7 @@ pub fn find_approximate_subset(
             // Consider previously selected numbers for this selection only if we haven't already
             if !using_previous_cars {
                 if !try_extend_with_previous(
+                    cars,
                     &mut candidates_for_current_selection,
                     previously_selected,
                     &selected,
@@ -423,8 +452,6 @@ pub fn find_approximate_subset(
                         max_possible,
                     });
                 } else {
-                    using_previous_cars = true;
-
                     // Re-calculate min/max possible sums with expanded pool
                     let (new_min, new_max) = calculate_min_max_sums(
                         cars,
@@ -437,8 +464,9 @@ pub fn find_approximate_subset(
                         current_sum + new_max
                     );
 
-                    // Check if target is now reachable
-                    if current_sum + new_min <= target && current_sum + new_max >= target {
+                    // Check whether the expanded range reaches the tolerance-adjusted target.
+                    if target_is_reachable(current_sum, new_min, new_max, target, tolerance_percent)
+                    {
                         debug!("Target is now reachable with previously selected numbers");
                         // Continue with expanded pool
                     } else {
@@ -467,8 +495,6 @@ pub fn find_approximate_subset(
             let (final_choice, _) = handle_last_number(
                 cars,
                 &candidates_for_current_selection, // No longer needs mut
-                previously_selected,
-                &selected,
                 current_sum,
                 target,
                 tolerance_percent,
@@ -478,16 +504,15 @@ pub fn find_approximate_subset(
         }
 
         let chosen = select_candidate(
-            cars,
             &mut candidates_for_current_selection,
-            previously_selected,
-            &selected,
-            current_sum,
-            using_previous_cars,
-            target,
-            remaining_needed,
-            &mut rng,
-            &mut total_backtracks,
+            CandidateSelectionContext {
+                cars,
+                current_sum,
+                target,
+                remaining_needed,
+                rng: &mut rng,
+                total_backtracks: &mut total_backtracks,
+            },
         );
 
         current_sum += get_lap_time(cars, chosen);
@@ -497,7 +522,7 @@ pub fn find_approximate_subset(
             get_lap_time(cars, chosen),
             current_sum,
             target,
-            (current_sum as f64 / target as f64 * 100.0)
+            accuracy_percent(current_sum, target)
         );
 
         // Remove the chosen number from the original remaining numbers if it was from there
@@ -532,18 +557,28 @@ pub fn find_approximate_subset(
     Err(SubsetError::NoValidSubset)
 }
 
-fn select_candidate(
-    cars: &[Car],
-    candidates_for_current_selection: &mut [CarIndex],
-    previously_selected: &HashSet<CarIndex>,
-    selected: &[CarIndex],
+struct CandidateSelectionContext<'a, R> {
+    cars: &'a [Car],
     current_sum: u32,
-    using_previous_cars: bool,
     target: u32,
     remaining_needed: usize,
-    rng: &mut impl rand::Rng,
-    total_backtracks: &mut u32,
+    rng: &'a mut R,
+    total_backtracks: &'a mut u32,
+}
+
+fn select_candidate<R: rand::Rng>(
+    candidates_for_current_selection: &mut [CarIndex],
+    context: CandidateSelectionContext<'_, R>,
 ) -> CarIndex {
+    let CandidateSelectionContext {
+        cars,
+        current_sum,
+        target,
+        remaining_needed,
+        rng,
+        total_backtracks,
+    } = context;
+
     let (min_possible_remaining, max_possible_remaining) =
         calculate_min_max_sums(cars, candidates_for_current_selection, remaining_needed - 1);
 
@@ -588,10 +623,7 @@ fn select_candidate(
     let (chosen_temp, used_backtrack) = fallback_strategy(
         cars,
         candidates_for_current_selection,
-        previously_selected,
-        selected,
         current_sum,
-        using_previous_cars,
         target,
         remaining_needed,
     );
@@ -634,33 +666,33 @@ pub fn get_target_range_for_subset(cars: &[Car], lap_count: usize) -> (u32, u32)
 
 pub fn read_cars_from_csv_string(
     csv_content: &str,
-    id_column: usize,
-    time_column: usize,
-    start_line: usize,
 ) -> Result<Vec<Car>, Box<dyn std::error::Error>> {
     use std::collections::HashSet;
 
     let mut cars = Vec::new();
     let mut seen_ids = HashSet::new();
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(csv_content.as_bytes());
 
-    for (i, line) in csv_content.lines().enumerate() {
-        // Skip lines before start_line
-        if i < start_line {
-            continue;
-        }
+    for (i, result) in reader.records().enumerate() {
+        let record = match result {
+            Ok(rec) => rec,
+            Err(e) => {
+                debug!("Warning: Failed to parse record on line {}: {}", i + 1, e);
+                continue;
+            }
+        };
 
-        let fields: Vec<&str> = line.split(',').collect();
+        // Expect vehicle in column 0, lap_time in column 1
+        let id = match record.get(0) {
+            Some(val) => val.trim().to_string(),
+            None => {
+                debug!("Warning: Missing vehicle ID on line {}", i + 1);
+                continue;
+            }
+        };
 
-        // Ensure we have enough fields
-        if fields.len() <= id_column || fields.len() <= time_column {
-            debug!("Warning: Line {} has fewer columns than required", i + 1);
-            continue;
-        }
-
-        // Get ID as string directly
-        let id = fields[id_column].trim().to_string();
-
-        // Check for duplicate IDs
         if !seen_ids.insert(id.clone()) {
             debug!(
                 "Warning: Duplicate ID '{}' found on line {}, skipping",
@@ -670,12 +702,22 @@ pub fn read_cars_from_csv_string(
             continue;
         }
 
-        // Parse lap time
-        let time_str = fields[time_column].trim();
+        let time_str = match record.get(1) {
+            Some(val) => val.trim(),
+            None => {
+                debug!(
+                    "Warning: Missing lap time for ID '{}' on line {}",
+                    id,
+                    i + 1
+                );
+                continue;
+            }
+        };
+
         let lap_time = match parse_lap_time(time_str) {
             Ok(time) => time,
             Err(e) => {
-                debug!("Warning: {} on line {}", e, i + 1);
+                debug!("Warning: {} for ID '{}' on line {}", e, id, i + 1);
                 continue;
             }
         };
@@ -774,7 +816,11 @@ pub fn compute_jaccard_similarity(results: &[Vec<CarIndex>]) -> Result<f64, Stri
         for j in (i + 1)..sets.len() {
             let intersection_size = sets[i].intersection(&sets[j]).count();
             let union_size = sets[i].union(&sets[j]).count();
-            let jaccard = intersection_size as f64 / union_size as f64;
+            let jaccard = if union_size == 0 {
+                1.0
+            } else {
+                intersection_size as f64 / union_size as f64
+            };
             total_similarity += jaccard;
             count += 1;
         }
@@ -900,10 +946,11 @@ pub fn perform_multiple_runs(
                 });
             }
 
-            let attempt = match find_approximate_subset(
+            let attempt = match find_approximate_subset_from_candidates(
                 global_cars,
                 target,
                 lap_count,
+                &available_indexes,
                 &previously_selected,
                 tolerance_percent,
             ) {
@@ -977,7 +1024,11 @@ pub fn perform_multiple_runs(
     }
 
     if !all_results.is_empty() {
-        let avg_accuracy = (total_sum as f64) / (all_results.len() as f64 * target as f64) * 100.0;
+        let avg_accuracy = all_results
+            .iter()
+            .map(|subset| accuracy_percent(calculate_subset_sum(global_cars, subset), target))
+            .sum::<f64>()
+            / all_results.len() as f64;
 
         info!("\n=== SUMMARY ===");
         info!(
@@ -1127,6 +1178,69 @@ pub async fn worker_perform_multiple_runs(
         Ok(result) => serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL),
         Err(e) => serde_wasm_bindgen::to_value(&format!("Calculation failed: {}", e))
             .unwrap_or(JsValue::NULL),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn car(id: &str, lap_time: u32) -> Car {
+        Car {
+            id: id.to_string(),
+            lap_time,
+        }
+    }
+
+    #[test]
+    fn multiple_runs_use_unused_candidates_before_reusing_cars() {
+        let cars = vec![car("first", 10), car("second", 10)];
+
+        let results = perform_multiple_runs(&cars, 10, 1, 2, 1_000.0, 0.0).unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_ne!(results[0][0], results[1][0]);
+    }
+
+    #[test]
+    fn extending_candidates_sorts_and_deduplicates_indexes() {
+        let cars = vec![car("slow", 30), car("fast", 10), car("middle", 20)];
+        let previously_selected = HashSet::from([0, 1, 2]);
+        let mut candidates = vec![2];
+
+        assert!(try_extend_with_previous(
+            &cars,
+            &mut candidates,
+            &previously_selected,
+            &[],
+        ));
+        assert_eq!(candidates, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn closest_time_handles_full_u32_range() {
+        let cars = vec![car("zero", 0), car("max", u32::MAX)];
+
+        assert_eq!(find_closest_time(&cars, &[0, 1], u32::MAX - 1), 1);
+    }
+
+    #[test]
+    fn reachability_accepts_tolerance_boundary() {
+        let cars = vec![car("near", 99)];
+
+        assert!(target_is_reachable(0, 99, 99, 100, 1.0));
+        assert!(!target_is_reachable(0, 98, 98, 100, 1.0));
+        assert_eq!(
+            find_approximate_subset(&cars, 100, 1, &HashSet::new(), 1.0).unwrap(),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn jaccard_handles_empty_pairs_and_rejects_fewer_than_two_subsets() {
+        assert_eq!(compute_jaccard_similarity(&[vec![], vec![]]).unwrap(), 1.0);
+        assert!(compute_jaccard_similarity(&[]).is_err());
+        assert!(compute_jaccard_similarity(&[vec![1]]).is_err());
     }
 }
 

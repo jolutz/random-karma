@@ -1,57 +1,65 @@
-name: Deploy RustWASM webapp
+name: Deploy GitHub Pages
 
 on:
   push:
-    branches: ["master"]
-  pull_request:
-    branches: ["master"]
+    branches: [master]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Build Pages artifact
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
-      - name: Restore cache
-        uses: actions/cache@v3
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo downloads and Trunk
+        uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin
-            ~/.cargo/git
+            ~/.cargo/bin/trunk
             ~/.cargo/registry
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            ~/.cargo/git
+          key: ${{ runner.os }}-trunk-0.21.14-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-trunk-0.21.14-
 
       - name: Install Trunk
-        uses: jetli/trunk-action@v0.5.0
-        with:
-          # Optional version of trunk to install(eg. 'v0.16.0', 'latest')
-          version: "latest"
-      - name: Add WASM build target
-        run: |
-          rustup target add wasm32-unknown-unknown
-      - name: Run trunk build
-        run: trunk build --public-url "/random-karma"
+        run: cargo install trunk --version 0.21.14 --locked
 
-      - name: Setup Pages
-        uses: actions/configure-pages@v3
-      - name: Upload artifact
+      - name: Build
+        run: trunk build --release
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: "./dist"
+          path: dist
 
   deploy:
+    name: Deploy Pages artifact
     needs: build
     runs-on: ubuntu-latest
-    
     permissions:
       pages: write
       id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
     steps:
       - name: Deploy to GitHub Pages
         id: deployment

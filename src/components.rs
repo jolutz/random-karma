@@ -10,30 +10,82 @@ use yew::prelude::*;
 
 /// Calculate total time for a subset
 fn calculate_total_time(cars: &[Car], indices: &[usize]) -> u32 {
-    indices.iter().map(|&i| cars[i].lap_time).sum()
+    indices
+        .iter()
+        .filter_map(|&i| cars.get(i).map(|car| car.lap_time))
+        .sum()
 }
 
 /// Calculate percentage difference from target
 fn calculate_percentage_diff(actual: u32, target: u32) -> f64 {
+    if target == 0 {
+        return 0.0;
+    }
     let diff = actual as i64 - target as i64;
     (diff as f64 / target as f64) * 100.0
 }
 
-/// Renders the table with all calculated car selections.
-///
-/// Displays each subset as a row, showing:
-/// - Set number
-/// - Total time for the subset
-/// - Percentage deviation from target
-/// - Individual cars in the subset
-pub fn render_results(
+/// Renders a single result row in the table
+fn render_result_row(
     cars: &[Car],
-    all_results: &[Vec<usize>],
-    similarity: f64,
+    set: &[usize],
+    idx: usize,
     calculated_target: u32,
+    col_start: usize,
+    col_end: usize,
 ) -> Html {
+    let total = calculate_total_time(cars, set);
+    let pct = calculate_percentage_diff(total, calculated_target);
+
+    let mut all_cols = vec![];
+    all_cols.push(html! { <td class="sticky-col">{ idx + 1 }</td> });
+    all_cols.push(html! { <td>{ format_ms_to_minsecms(total) }</td> });
+    all_cols.push(html! { <td>{ format!("{:.2}%", pct) }</td> });
+    all_cols.extend(set.iter().map(|&i| {
+        if let Some(c) = cars.get(i) {
+            html! { <td>{ format!("{} ({})", c.id, format_ms_to_minsecms(c.lap_time)) }</td> }
+        } else {
+            html! { <td class="invalid-result">{ "Invalid car index" }</td> }
+        }
+    }));
+
+    let visible_cols = all_cols
+        .into_iter()
+        .skip(col_start)
+        .take(col_end.saturating_sub(col_start))
+        .collect::<Html>();
+
+    html! {
+        <tr>
+            { visible_cols }
+        </tr>
+    }
+}
+
+/// A wrapper component that implements virtualization for the results table.
+#[derive(Properties, PartialEq)]
+pub struct ResultsWrapperProps {
+    pub cars: Rc<Vec<Car>>,
+    pub all_results: Rc<Vec<Vec<usize>>>,
+    pub similarity: f64,
+    pub calculated_target: u32,
+}
+
+#[function_component(ResultsWrapper)]
+pub fn results_wrapper(props: &ResultsWrapperProps) -> Html {
+    let scroll_pos = use_state(|| (0.0, 0.0)); // (top, left)
+
+    let on_scroll = {
+        let scroll_pos = scroll_pos.clone();
+        Callback::from(move |e: Event| {
+            if let Some(target) = e.target_dyn_into::<web_sys::Element>() {
+                scroll_pos.set((target.scroll_top() as f64, target.scroll_left() as f64));
+            }
+        })
+    };
+
     // Early return for empty results
-    if all_results.is_empty() {
+    if props.all_results.is_empty() {
         return html! {
             <div class="results">
                 <p class="no-results-message">{ "No results to display" }</p>
@@ -41,175 +93,110 @@ pub fn render_results(
         };
     }
 
-    let subset_size = all_results.first().map(|s| s.len()).unwrap_or(0);
+    // --- Virtualization Constants ---
+    const ROW_HEIGHT: f64 = 38.0; // Corrected height based on CSS (padding + line-height + border)
+    const CONTAINER_HEIGHT: f64 = 600.0; // Fixed height of the scrollable container in pixels
+    const OVERSCAN_ROW_COUNT: usize = 10; // Number of rows to render above and below the viewport
+    const COLUMN_WIDTH: f64 = 200.0; // Increased width for better readability
+    const OVERSCAN_COL_COUNT: usize = 2; // Number of columns to render left and right of the viewport
+
+    let total_rows = props.all_results.len();
+    let subset_size = props.all_results.first().map(|s| s.len()).unwrap_or(0);
+    let total_columns = 3 + subset_size;
+
+    // --- Virtualization Calculations ---
+    let (scroll_top, scroll_left) = *scroll_pos;
+    let container_ref = use_node_ref();
+    let container_width = use_state(|| 0.0f64);
+    {
+        let container_ref = container_ref.clone();
+        let container_width = container_width.clone();
+        use_effect_with((), move |_| {
+            if let Some(element) = container_ref.cast::<web_sys::Element>() {
+                container_width.set(element.client_width() as f64);
+            }
+            || ()
+        });
+    }
+
+    // Rows
+    let visible_rows = (CONTAINER_HEIGHT / ROW_HEIGHT).ceil() as usize;
+    let start_row_node = (scroll_top / ROW_HEIGHT).floor() as usize;
+    let start_row_index = start_row_node.saturating_sub(OVERSCAN_ROW_COUNT);
+    let end_row_index = (start_row_node + visible_rows + OVERSCAN_ROW_COUNT).min(total_rows);
+
+    // Columns
+    let visible_cols = (*container_width / COLUMN_WIDTH).ceil() as usize;
+    let start_col_node = (scroll_left / COLUMN_WIDTH).floor() as usize;
+    let start_col_index = start_col_node.saturating_sub(OVERSCAN_COL_COUNT);
+    let end_col_index = (start_col_node + visible_cols + OVERSCAN_COL_COUNT).min(total_columns);
+
+    let visible_items = props
+        .all_results
+        .iter()
+        .skip(start_row_index)
+        .take(end_row_index - start_row_index)
+        .enumerate()
+        .map(|(i, set)| {
+            let original_index = start_row_index + i;
+            render_result_row(
+                &props.cars,
+                set,
+                original_index,
+                props.calculated_target,
+                start_col_index,
+                end_col_index,
+            )
+        })
+        .collect::<Html>();
+
+    let total_height = total_rows as f64 * ROW_HEIGHT;
+    let offset_y = start_row_index as f64 * ROW_HEIGHT;
+
+    let total_width = total_columns as f64 * COLUMN_WIDTH;
+    let offset_x = start_col_index as f64 * COLUMN_WIDTH;
+
+    // --- Header Rendering ---
+    let mut header_cols = vec![];
+    header_cols.push(html! { <th class="sticky-col">{ "Set #" }</th> });
+    header_cols.push(html! { <th>{ "Total Time" }</th> });
+    header_cols.push(html! {
+        <th>
+            { format!("% Off Target ({})", format_ms_to_minsecms(props.calculated_target)) }
+        </th>
+    });
+    header_cols.extend((0..subset_size).map(|i| html! { <th>{ format!("Car {}", i + 1) }</th> }));
+
+    let visible_header_cols = header_cols
+        .into_iter()
+        .skip(start_col_index)
+        .take(end_col_index - start_col_index)
+        .collect::<Html>();
 
     html! {
         <div class="results">
             <div class="similarity-status">
-                { format!("Jaccard Similarity: {:.2}%", similarity * 100.0) }
+                { format!("Jaccard Similarity: {:.2}%", props.similarity * 100.0) }
             </div>
             <div class="result-sets">
                 <h3>{ "All Car Selections" }</h3>
-                <div class="big-car-table-container">
-                    <table class="big-car-table">
-                        <thead>
-                            <tr>
-                                <th>{ "Set #" }</th>
-                                <th>{ "Total Time" }</th>
-                                <th>{ format!("% Off Target ({})",
-                                              format_ms_to_minsecms(calculated_target)) }</th>
-                                { (0..subset_size).map(|i| {
-                                    html!{ <th>{ format!("Car {}", i + 1) }</th> }
-                                }).collect::<Html>() }
-                            </tr>
-                        </thead>
-                        <tbody>
-                            { all_results.iter().enumerate().map(|(idx, set)| {
-                                render_result_row(cars, set, idx, calculated_target)
-                            }).collect::<Html>() }
-                        </tbody>
-                    </table>
+                <div ref={container_ref} class="big-car-table-container" onscroll={on_scroll} style={format!("height: {}px; overflow: auto;", CONTAINER_HEIGHT)}>
+                    <div style={format!("height: {}px; width: {}px; position: relative;", total_height, total_width)}>
+                        <table class="big-car-table" style={format!("position: absolute; top: {}px; left: {}px; table-layout: fixed; width: {}px;", offset_y, offset_x, total_width)}>
+                            <colgroup>
+                                { for (0..total_columns).map(|_| html!{ <col style={format!("width: {}px", COLUMN_WIDTH)} /> }) }
+                            </colgroup>
+                            <thead>
+                                <tr>
+                                    { visible_header_cols }
+                                </tr>
+                            </thead>
+                            <tbody>
+                                { visible_items }
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
-            </div>
-        </div>
-    }
-}
-
-/// Renders a single result row in the table
-fn render_result_row(cars: &[Car], set: &[usize], idx: usize, calculated_target: u32) -> Html {
-    let total = calculate_total_time(cars, set);
-    let pct = calculate_percentage_diff(total, calculated_target);
-
-    html! {
-        <tr>
-            <td>{ idx + 1 }</td>
-            <td>{ format_ms_to_minsecms(total) }</td>
-            <td>{ format!("{:+.2}%", pct) }</td>
-            { set.iter().map(|&i| {
-                let c = &cars[i];
-                html! {
-                    <td>{ format!("{} ({})", c.id, format_ms_to_minsecms(c.lap_time)) }</td>
-                }
-            }).collect::<Html>() }
-        </tr>
-    }
-}
-
-/// Slider component for selecting target value with index-to-value mapping.
-#[derive(Properties, PartialEq)]
-pub struct TargetSliderProps {
-    pub slider_idx: usize,
-    pub target: u32,
-    pub oninput: Callback<InputEvent>,
-}
-
-#[function_component(TargetSlider)]
-pub fn target_slider(props: &TargetSliderProps) -> Html {
-    html! {
-        <div class="form-group">
-            <label for="target">{ "Target Time:" }</label>
-            <div class="slider-with-value">
-                <input type="range"
-                    min="0"
-                    max="99"
-                    step="1"
-                    value={props.slider_idx.to_string()}
-                    oninput={props.oninput.clone()}
-                />
-                <span class="slider-value">{
-                    format!("{} (index {}/99)",
-                            format_ms_to_minsecms(props.target), props.slider_idx)
-                }</span>
-            </div>
-        </div>
-    }
-}
-
-/// Slider component for selecting subset size with dynamic max value.
-#[derive(Properties, PartialEq)]
-pub struct LapCountSliderProps {
-    pub lap_count: usize,
-    pub max: usize,
-    pub oninput: Callback<InputEvent>,
-}
-
-#[function_component(SubsetSlider)]
-pub fn subset_slider(props: &LapCountSliderProps) -> Html {
-    html! {
-        <div class="form-group">
-            <label for="lap_count">{ "Lap Count:" }</label>
-            <div class="slider-with-value">
-                <input type="range"
-                    min="1"
-                    max={props.max.to_string()}
-                    value={props.lap_count.to_string()}
-                    oninput={props.oninput.clone()}
-                />
-                <span class="slider-value">{ format!("{} (max: {})", props.lap_count, props.max) }</span>
-            </div>
-        </div>
-    }
-}
-
-/// Slider component for selecting number of runs with dynamic max value.
-#[derive(Properties, PartialEq)]
-pub struct PlayerCountSliderProps {
-    pub player_count: usize,
-    pub max: usize,
-    pub oninput: Callback<InputEvent>,
-}
-
-#[function_component(RunsSlider)]
-pub fn runs_slider(props: &PlayerCountSliderProps) -> Html {
-    html! {
-        <div class="form-group">
-            <label for="player_count">{ "Player Count:" }</label>
-            <div class="slider-with-value">
-                <input type="range"
-                    min="0"
-                    max={props.max.to_string()}
-                    value={props.player_count.to_string()}
-                    oninput={props.oninput.clone()}
-                />
-                <span class="slider-value">{ props.player_count }</span>
-            </div>
-        </div>
-    }
-}
-
-/// Displays cache status including filled count, error count, failed targets, and total entries.
-#[derive(Properties, PartialEq)]
-pub struct CacheInfoProps {
-    pub cached_count: usize,
-    pub precache_error_count: usize,
-    pub precache_failed_targets: Rc<Vec<u32>>,
-    pub total: usize,
-}
-
-#[function_component(CacheInfo)]
-pub fn cache_info(props: &CacheInfoProps) -> Html {
-    html! {
-        <div class="cache-info-container">
-            <div class="cache-status">
-                { format!("Cache filled for current Subset & Runs: {}/100", props.cached_count) }
-            </div>
-            { if props.precache_error_count > 0 {
-                html!{
-                    <div class="cache-error-status">
-                        { format!("Pre-cache tasks failed for current Subset & Runs: {}", props.precache_error_count) }
-                    </div>
-                }
-            } else { html!{} } }
-            { if !props.precache_failed_targets.is_empty() {
-                html!{
-                    <div class="cache-failed-targets">
-                        { "Failed Targets (ms): " }
-                        { props.precache_failed_targets.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ") }
-                    </div>
-                }
-            } else { html!{} } }
-            <div class="cache-status-global">
-                { format!("Total entries in cache: {}", props.total) }
             </div>
         </div>
     }
