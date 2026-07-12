@@ -3,6 +3,7 @@
   --primary: #6d5dfc;
   --primary-hover: #5848e5;
   --primary-soft: color-mix(in srgb, var(--primary) 12%, transparent);
+  --primary-soft-solid: color-mix(in srgb, var(--primary) 12%, var(--surface-solid));
   --accent: #18b6a4;
   --success: #18a66a;
   --warning: #d89113;
@@ -35,6 +36,7 @@
     --primary: #9285ff;
     --primary-hover: #aa9fff;
     --primary-soft: rgba(146, 133, 255, .14);
+    --primary-soft-solid: color-mix(in srgb, var(--primary) 14%, var(--surface-solid));
     --accent: #39d5c2;
     --success: #3dd895;
     --warning: #f2b84b;
@@ -218,6 +220,7 @@ button:disabled { opacity: .5; cursor: not-allowed; transform: none; }
 .big-car-table th { height: 44px; padding: .7rem .85rem; border-bottom: 1px solid var(--border); color: var(--text-muted); background: var(--surface-2); font-size: .7rem; font-weight: 750; letter-spacing: .035em; text-align: left; text-transform: uppercase; white-space: nowrap; }
 .big-car-table td { height: 44px; max-width: 230px; padding: .65rem .85rem; overflow: hidden; border-bottom: 1px solid var(--grid); text-overflow: ellipsis; white-space: nowrap; }
 .big-car-table tbody tr:not(.table-spacer):hover td { background: var(--primary-soft); }
+.big-car-table tbody tr:not(.table-spacer):hover .sticky-col { background: var(--primary-soft-solid); }
 .big-car-table .sticky-col { position: sticky; left: 0; z-index: 2; min-width: 4.5rem; border-right: 1px solid var(--border); background: var(--surface-solid); font-weight: 700; }
 .big-car-table thead .sticky-col { z-index: 4; background: var(--surface-2); }
 .table-spacer td { height: 0; padding: 0; border: 0; }

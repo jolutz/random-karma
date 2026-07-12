@@ -81,16 +81,19 @@ function createChartConfig(min, max) {
 		data: { datasets: [{
 			label: 'Jaccard similarity', data: [], borderColor: colors.primary,
 			backgroundColor: colors.primary, pointBackgroundColor: colors.surface,
-			pointBorderColor: colors.primary, borderWidth: 2.5, pointBorderWidth: 2,
-			pointRadius: 2.5, pointHoverRadius: 6, tension: .32, fill: false,
+			pointBorderColor: colors.primary, pointHoverBorderColor: colors.primary,
+			pointHoverBackgroundColor: colors.surface, borderWidth: 2.5,
+			pointBorderWidth: 2, pointHoverBorderWidth: 2,
+			pointRadius: 3, pointHoverRadius: 6, pointHitRadius: 10, tension: .32, fill: false,
 		}] },
 		options: {
 			animation: false, responsive: true, maintainAspectRatio: false, normalized: true,
 			parsing: false, spanGaps: true, interaction: { mode: 'nearest', intersect: false },
 			onClick: event => {
-				const points = chart?.getElementsAtEventForMode(event, 'nearest', { intersect: true }, false) || [];
-				if (!points.length) return;
-				const point = points[0];
+				const activePoint = chart?.getActiveElements()[0];
+				const point = activePoint
+					|| chart?.getElementsAtEventForMode(event, 'nearest', { intersect: false }, false)?.[0];
+				if (!point) return;
 				const target = chart.data.datasets[point.datasetIndex].data[point.index]?.x;
 				const slider = document.querySelector('.target-slider-container input[type="range"]');
 				if (slider && target != null) {
