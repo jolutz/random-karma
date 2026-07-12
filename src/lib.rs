@@ -364,7 +364,6 @@ pub const DEFAULT_SOLVER_STRATEGY: SolverStrategy = SolverStrategy::Bounded;
 
 const BOUNDED_NODE_LIMIT: usize = 500_000;
 const BOUNDED_RANDOM_ATTEMPTS: usize = 512;
-const BOUNDED_UNUSED_PHASE_ATTEMPTS: usize = 8;
 
 const EXACT_POOL_LIMIT: usize = 20;
 const DEADLINE_CHECK_INTERVAL: usize = 256;
@@ -433,6 +432,7 @@ fn find_approximate_subset_with_strategy_and_rng<R: rand::Rng>(
                 tolerance_percent,
                 unused: &available_indexes,
                 previously_selected,
+                usage_counts: None,
             };
             bounded_find_approximate_subset_with_rng(cars, request, rng, || false)
         }
@@ -479,6 +479,7 @@ struct BoundedRequest<'a> {
     tolerance_percent: f64,
     unused: &'a [CarIndex],
     previously_selected: &'a HashSet<CarIndex>,
+    usage_counts: Option<&'a [usize]>,
 }
 
 struct BoundedSearch<'a, F> {
@@ -564,88 +565,14 @@ impl<F: FnMut() -> bool> BoundedSearch<'_, F> {
     }
 }
 
-fn complete_two_slots(
-    cars: &[Car],
-    pool: &[CarIndex],
-    used: &[bool],
-    sum: u64,
-    accepted: (u64, u64),
-) -> Option<[CarIndex; 2]> {
-    let mut left = 0;
-    let mut right = pool.len().checked_sub(1)?;
-    while left < right {
-        while left < right && used[pool[left]] {
-            left += 1;
-        }
-        while left < right && used[pool[right]] {
-            right -= 1;
-        }
-        if left >= right {
-            break;
-        }
-        let total =
-            sum + u64::from(cars[pool[left]].lap_time) + u64::from(cars[pool[right]].lap_time);
-        if total < accepted.0 {
-            left += 1;
-        } else if total > accepted.1 {
-            right -= 1;
-        } else {
-            return Some([pool[left], pool[right]]);
-        }
-    }
-    None
-}
-
-fn complete_three_slots<F: FnMut() -> bool>(
-    cars: &[Car],
-    pool: &[CarIndex],
-    used: &[bool],
-    sum: u64,
-    accepted: (u64, u64),
-    deadline_exceeded: &mut F,
-) -> Option<[CarIndex; 3]> {
-    for (first_position, &first) in pool.iter().enumerate() {
-        if used[first] {
-            continue;
-        }
-        if first_position.is_multiple_of(DEADLINE_CHECK_INTERVAL) && deadline_exceeded() {
-            return None;
-        }
-        let mut left = first_position + 1;
-        let mut right = pool.len().checked_sub(1)?;
-        while left < right {
-            while left < right && used[pool[left]] {
-                left += 1;
-            }
-            while left < right && used[pool[right]] {
-                right -= 1;
-            }
-            if left >= right {
-                break;
-            }
-            let total = sum
-                + u64::from(cars[first].lap_time)
-                + u64::from(cars[pool[left]].lap_time)
-                + u64::from(cars[pool[right]].lap_time);
-            if total < accepted.0 {
-                left += 1;
-            } else if total > accepted.1 {
-                right -= 1;
-            } else {
-                return Some([first, pool[left], pool[right]]);
-            }
-        }
-    }
-    None
-}
-
 struct RandomizedSearchRequest<'a> {
     pool: &'a [CarIndex],
     lap_count: usize,
     target: u64,
     accepted: (u64, u64),
     attempt_limit: usize,
-    prefer_directed: bool,
+    usage_counts: Option<&'a [usize]>,
+    complement: bool,
 }
 
 fn randomized_bounded_search<R: rand::Rng, F: FnMut() -> bool>(
@@ -660,104 +587,398 @@ fn randomized_bounded_search<R: rand::Rng, F: FnMut() -> bool>(
         target,
         accepted,
         attempt_limit,
-        prefer_directed,
+        usage_counts,
+        complement,
     } = request;
-    let minimum = pool
-        .iter()
-        .take(lap_count)
-        .map(|&index| u64::from(cars[index].lap_time))
-        .sum::<u64>();
-    let maximum = pool
-        .iter()
-        .rev()
-        .take(lap_count)
-        .map(|&index| u64::from(cars[index].lap_time))
-        .sum::<u64>();
-    let span = maximum.saturating_sub(minimum);
-    let needs_directed_extreme = target <= minimum + span / 10 || target >= minimum + span * 3 / 5;
+    let mut selected = Vec::with_capacity(lap_count);
+    let mut unselected = Vec::with_capacity(pool.len().saturating_sub(lap_count));
+    let mut used = vec![false; cars.len()];
+
+    // Cheap directed boundary constructions are also valuable repair anchors:
+    // exact range-edge requests should not spend attempts rediscovering them.
+    let mut exact_boundary = None;
+    let mut exact_boundary_score = usize::MAX;
+    for reverse in [false, true] {
+        selected.clear();
+        if reverse {
+            selected.extend(pool.iter().rev().take(lap_count).copied());
+        } else {
+            selected.extend(pool.iter().take(lap_count).copied());
+        }
+        let boundary_sum = calculate_subset_sum_u64(cars, &selected);
+        if boundary_sum.abs_diff(target) <= 1
+            || (complement
+                && usage_counts.is_some()
+                && (accepted.0..=accepted.1).contains(&boundary_sum))
+        {
+            let usage = selected
+                .iter()
+                .map(|&index| usage_counts.map_or(0, |counts| counts[index]))
+                .sum::<usize>();
+            let balance = if complement {
+                usize::MAX - usage
+            } else {
+                usage
+            };
+            if balance < exact_boundary_score
+                || (balance == exact_boundary_score && rng.random_bool(0.5))
+            {
+                exact_boundary_score = balance;
+                exact_boundary = Some(selected.clone());
+            }
+        }
+    }
+    if exact_boundary.is_some() {
+        return exact_boundary;
+    }
+    selected.clear();
 
     for attempt in 0..attempt_limit {
-        if attempt % DEADLINE_CHECK_INTERVAL == 0 && deadline_exceeded() {
+        if attempt % 8 == 0 && deadline_exceeded() {
             return None;
         }
-        let mut selected = Vec::with_capacity(lap_count);
-        let mut used = vec![false; cars.len()];
+        for &index in &selected {
+            used[index] = false;
+        }
+        selected.clear();
         let mut sum = 0_u64;
-        let directed = (prefer_directed && attempt < 8) || (attempt == 0 && needs_directed_extreme);
-        let construction_slots = lap_count.saturating_sub(if directed { 3 } else { 2 });
-        for slot in 0..construction_slots {
-            let available = pool
+
+        // The first construction is the nearer cardinality boundary. The same
+        // swap path can then move monotonically into the interior without an
+        // average-greedy construction exhausting one side of the value range.
+        let usage_is_uniform = usage_counts.is_none_or(|counts| {
+            counts
+                .first()
+                .is_none_or(|first| counts.iter().all(|count| count == first))
+        });
+        if attempt == 0 && (complement || usage_is_uniform) {
+            let minimum = pool
                 .iter()
-                .copied()
-                .filter(|&index| !used[index])
-                .collect::<Vec<_>>();
-            let index = if directed {
-                let remaining_after = lap_count - slot - 1;
-                let mut feasible = available
-                    .iter()
-                    .copied()
-                    .filter(|&candidate| {
-                        let candidate_sum = sum + u64::from(cars[candidate].lap_time);
-                        let mut rest = available
-                            .iter()
-                            .copied()
-                            .filter(|&index| index != candidate)
-                            .map(|index| u64::from(cars[index].lap_time));
-                        let min_add = rest.by_ref().take(remaining_after).sum::<u64>();
-                        let max_add = available
-                            .iter()
-                            .rev()
-                            .copied()
-                            .filter(|&index| index != candidate)
-                            .take(remaining_after)
-                            .map(|index| u64::from(cars[index].lap_time))
-                            .sum::<u64>();
-                        candidate_sum + min_add <= accepted.1
-                            && candidate_sum + max_add >= accepted.0
-                    })
-                    .collect::<Vec<_>>();
-                feasible.shuffle(rng);
-                *feasible.first()?
+                .take(lap_count)
+                .map(|&index| u64::from(cars[index].lap_time))
+                .sum::<u64>();
+            let maximum = pool
+                .iter()
+                .rev()
+                .take(lap_count)
+                .map(|&index| u64::from(cars[index].lap_time))
+                .sum::<u64>();
+            let shift = if maximum == minimum {
+                0
             } else {
-                available[rng.random_range(0..available.len())]
+                let position = target.saturating_sub(minimum).min(maximum - minimum);
+                (position * pool.len().saturating_sub(lap_count) as u64 / (maximum - minimum))
+                    as usize
             };
+            selected.extend(pool[shift..shift + lap_count].iter().copied());
+            for &index in &selected {
+                used[index] = true;
+                sum += u64::from(cars[index].lap_time);
+            }
+        }
+
+        // Build every cardinality through the same target-directed path. The
+        // pool is sorted once by the caller and reusable membership state
+        // avoids per-slot candidate allocation.
+        for slot in selected.len()..lap_count {
+            if slot.is_multiple_of(32) && deadline_exceeded() {
+                return None;
+            }
+            let remaining = lap_count - slot;
+            let required_average = if target >= sum {
+                (target - sum) / remaining as u64
+            } else {
+                0
+            };
+            let wanted = if usage_counts.is_none() && !complement {
+                let span = u64::from(cars[*pool.last()?].lap_time)
+                    .saturating_sub(u64::from(cars[pool[0]].lap_time));
+                let jitter = span / 64;
+                if jitter > 0 && rng.random_bool(0.5) {
+                    required_average.saturating_add(rng.random_range(0..=jitter))
+                } else if jitter > 0 {
+                    required_average.saturating_sub(rng.random_range(0..=jitter))
+                } else {
+                    required_average
+                }
+            } else {
+                required_average
+            };
+            let mut best = None;
+            let mut best_score = (usize::MAX, u64::MAX);
+            let mut ties = 0_u32;
+            for &index in pool {
+                if used[index] {
+                    continue;
+                }
+                let usage = usage_counts.map_or(0, |counts| counts[index]);
+                let balance = if complement {
+                    usize::MAX - usage
+                } else {
+                    usage
+                };
+                let difference = u64::from(cars[index].lap_time).abs_diff(wanted);
+                let score = (balance, difference);
+                if score < best_score {
+                    best = Some(index);
+                    best_score = score;
+                    ties = 1;
+                } else if score == best_score {
+                    ties += 1;
+                    if rng.random_ratio(1, ties) {
+                        best = Some(index);
+                    }
+                }
+            }
+            let index = best?;
             used[index] = true;
             selected.push(index);
             sum += u64::from(cars[index].lap_time);
         }
 
-        match lap_count - construction_slots {
-            1 => {
-                let wanted = target.saturating_sub(sum);
-                if let Some(&index) = pool
-                    .iter()
-                    .filter(|&&index| !used[index])
-                    .min_by_key(|&&index| u64::from(cars[index].lap_time).abs_diff(wanted))
-                {
-                    selected.push(index);
+        // Improve with 1-for-1 swaps. Binary search locates the replacement
+        // value and membership is checked in the reusable `used` array.
+        for repair in 0..lap_count.saturating_mul(2).min(512) {
+            if (accepted.0..=accepted.1).contains(&sum) {
+                return Some(selected.clone());
+            }
+            if repair.is_multiple_of(32) && deadline_exceeded() {
+                return None;
+            }
+            let old_error = sum.abs_diff(target);
+            let mut best_swap = None;
+            let mut best_score = (u64::MAX, usize::MAX, usize::MAX);
+            let start = if selected.is_empty() {
+                0
+            } else {
+                rng.random_range(0..selected.len())
+            };
+            for offset in 0..selected.len() {
+                let selected_position = (start + offset) % selected.len();
+                let outgoing = selected[selected_position];
+                let base = sum - u64::from(cars[outgoing].lap_time);
+                let wanted = target.saturating_sub(base);
+                let pivot = pool.partition_point(|&index| u64::from(cars[index].lap_time) < wanted);
+                for distance in 0..pool.len() {
+                    let positions = [
+                        pivot
+                            .checked_add(distance)
+                            .filter(|&position| position < pool.len()),
+                        pivot.checked_sub(distance + 1),
+                    ];
+                    let mut saw_unselected = false;
+                    for position in positions.into_iter().flatten() {
+                        let incoming = pool[position];
+                        if used[incoming] {
+                            continue;
+                        }
+                        saw_unselected = true;
+                        let candidate_sum = base + u64::from(cars[incoming].lap_time);
+                        if (accepted.0..=accepted.1).contains(&candidate_sum) {
+                            used[outgoing] = false;
+                            used[incoming] = true;
+                            selected[selected_position] = incoming;
+                            return Some(selected.clone());
+                        }
+                        let error = candidate_sum.abs_diff(target);
+                        if error < old_error {
+                            let incoming_usage = usage_counts.map_or(0, |counts| counts[incoming]);
+                            let outgoing_usage = usage_counts.map_or(0, |counts| counts[outgoing]);
+                            let balance = if complement {
+                                (usize::MAX - incoming_usage, outgoing_usage)
+                            } else {
+                                (incoming_usage, usize::MAX - outgoing_usage)
+                            };
+                            let score = (error, balance.0, balance.1);
+                            if score < best_score || (score == best_score && rng.random_bool(0.5)) {
+                                best_score = score;
+                                best_swap =
+                                    Some((selected_position, outgoing, incoming, candidate_sum));
+                            }
+                        }
+                    }
+                    if saw_unselected && distance >= 2 {
+                        break;
+                    }
                 }
             }
-            2 => {
-                if let Some(pair) = complete_two_slots(cars, pool, &used, sum, accepted) {
-                    selected.extend(pair);
-                }
-            }
-            3 => {
-                if let Some(triple) =
-                    complete_three_slots(cars, pool, &used, sum, accepted, deadline_exceeded)
-                {
-                    selected.extend(triple);
-                }
-            }
-            _ => {}
+            let Some((position, outgoing, incoming, candidate_sum)) = best_swap else {
+                break;
+            };
+            used[outgoing] = false;
+            used[incoming] = true;
+            selected[position] = incoming;
+            sum = candidate_sum;
         }
-        if selected.len() == lap_count
-            && (accepted.0..=accepted.1).contains(&calculate_subset_sum_u64(cars, &selected))
-        {
-            return Some(selected);
+
+        // A 1-swap local optimum can still be separated from the interval by
+        // two coordinated replacements. Rebuild one sorted scratch list and
+        // use a two-pointer exact pair search for a bounded set of outgoing
+        // pairs; no pair candidates are allocated.
+        for round in 0..8 {
+            if (accepted.0..=accepted.1).contains(&sum) {
+                return Some(selected.clone());
+            }
+            if deadline_exceeded() {
+                return None;
+            }
+            unselected.clear();
+            unselected.extend(pool.iter().copied().filter(|&index| !used[index]));
+            if selected.len() < 2 || unselected.len() < 2 {
+                break;
+            }
+            let old_error = sum.abs_diff(target);
+            let mut best = None;
+            let mut best_score = (old_error, usize::MAX, usize::MAX);
+            let pair_limit = selected.len().saturating_mul(8).min(1_024);
+            let pair_start = rng.random_range(0..selected.len());
+            for pair_number in 0..pair_limit {
+                if pair_number.is_multiple_of(16) && deadline_exceeded() {
+                    return None;
+                }
+                let first_position = (pair_start + pair_number) % selected.len();
+                let second_position =
+                    (first_position + 1 + pair_number / selected.len()) % selected.len();
+                if first_position == second_position {
+                    continue;
+                }
+                let first_out = selected[first_position];
+                let second_out = selected[second_position];
+                let base = sum
+                    - u64::from(cars[first_out].lap_time)
+                    - u64::from(cars[second_out].lap_time);
+                let mut left = 0;
+                let mut right = unselected.len() - 1;
+                while left < right {
+                    let first_in = unselected[left];
+                    let second_in = unselected[right];
+                    let candidate_sum = base
+                        + u64::from(cars[first_in].lap_time)
+                        + u64::from(cars[second_in].lap_time);
+                    if (accepted.0..=accepted.1).contains(&candidate_sum) {
+                        used[first_out] = false;
+                        used[second_out] = false;
+                        used[first_in] = true;
+                        used[second_in] = true;
+                        selected[first_position] = first_in;
+                        selected[second_position] = second_in;
+                        return Some(selected.clone());
+                    }
+                    let error = candidate_sum.abs_diff(target);
+                    if error < old_error {
+                        let incoming_usage = usage_counts.map_or(0, |counts| {
+                            counts[first_in].saturating_add(counts[second_in])
+                        });
+                        let outgoing_usage = usage_counts.map_or(0, |counts| {
+                            counts[first_out].saturating_add(counts[second_out])
+                        });
+                        let balance = if complement {
+                            (usize::MAX - incoming_usage, outgoing_usage)
+                        } else {
+                            (incoming_usage, usize::MAX - outgoing_usage)
+                        };
+                        let score = (error, balance.0, balance.1);
+                        if score < best_score || (score == best_score && rng.random_bool(0.5)) {
+                            best_score = score;
+                            best = Some((
+                                first_position,
+                                second_position,
+                                first_out,
+                                second_out,
+                                first_in,
+                                second_in,
+                                candidate_sum,
+                            ));
+                        }
+                    }
+                    if candidate_sum < target {
+                        left += 1;
+                    } else {
+                        right -= 1;
+                    }
+                }
+            }
+            let Some((
+                first_position,
+                second_position,
+                first_out,
+                second_out,
+                first_in,
+                second_in,
+                candidate_sum,
+            )) = best
+            else {
+                break;
+            };
+            used[first_out] = false;
+            used[second_out] = false;
+            used[first_in] = true;
+            used[second_in] = true;
+            selected[first_position] = first_in;
+            selected[second_position] = second_in;
+            sum = candidate_sum;
+            if round == 7 && (accepted.0..=accepted.1).contains(&sum) {
+                return Some(selected.clone());
+            }
         }
     }
     None
+}
+
+struct DiversificationRequest<'a> {
+    pool: &'a [CarIndex],
+    selected: &'a mut [CarIndex],
+    accepted: (u64, u64),
+    usage_counts: &'a [usize],
+    prefer_selected_usage: bool,
+}
+
+fn diversify_valid_selection<R: rand::Rng, F: FnMut() -> bool>(
+    cars: &[Car],
+    request: DiversificationRequest<'_>,
+    rng: &mut R,
+    deadline_exceeded: &mut F,
+) {
+    let DiversificationRequest {
+        pool,
+        selected,
+        accepted,
+        usage_counts,
+        prefer_selected_usage,
+    } = request;
+    let mut used = vec![false; cars.len()];
+    for &index in selected.iter() {
+        used[index] = true;
+    }
+    let mut sum = calculate_subset_sum_u64(cars, selected);
+    let attempts = selected.len().saturating_mul(8).min(2_048);
+    for attempt in 0..attempts {
+        if attempt.is_multiple_of(DEADLINE_CHECK_INTERVAL) && deadline_exceeded() {
+            break;
+        }
+        let position = rng.random_range(0..selected.len());
+        let outgoing = selected[position];
+        let incoming = pool[rng.random_range(0..pool.len())];
+        if used[incoming] {
+            continue;
+        }
+        let improves_usage = if prefer_selected_usage {
+            usage_counts[incoming] > usage_counts[outgoing]
+        } else {
+            usage_counts[incoming] < usage_counts[outgoing]
+        };
+        if !improves_usage {
+            continue;
+        }
+        let candidate_sum =
+            sum - u64::from(cars[outgoing].lap_time) + u64::from(cars[incoming].lap_time);
+        if (accepted.0..=accepted.1).contains(&candidate_sum) {
+            used[outgoing] = false;
+            used[incoming] = true;
+            selected[position] = incoming;
+            sum = candidate_sum;
+        }
+    }
 }
 
 fn bounded_find_approximate_subset_with_rng<R: rand::Rng, F: FnMut() -> bool>(
@@ -766,58 +987,64 @@ fn bounded_find_approximate_subset_with_rng<R: rand::Rng, F: FnMut() -> bool>(
     rng: &mut R,
     mut deadline_exceeded: F,
 ) -> Result<Vec<CarIndex>, SubsetError> {
-    let accepted = accepted_sum_interval(request.target, request.tolerance_percent);
+    let original_accepted = accepted_sum_interval(request.target, request.tolerance_percent);
     if request.lap_count == 0 {
         let result = Vec::new();
-        validate_bounded_subset(cars, &result, 0, request.target, accepted)?;
+        validate_bounded_subset(cars, &result, 0, request.target, original_accepted)?;
         return Ok(result);
     }
 
-    let mut pools = vec![request.unused.to_vec()];
-    if !request.previously_selected.is_empty() {
+    let complement = request.lap_count > cars.len() - request.lap_count;
+    let search_count = request.lap_count.min(cars.len() - request.lap_count);
+    let total = cars.iter().map(|car| u64::from(car.lap_time)).sum::<u64>();
+    let accepted = if complement {
+        if original_accepted.0 > total {
+            return Err(SubsetError::NoValidSubset);
+        }
+        (
+            total.saturating_sub(original_accepted.1),
+            total - original_accepted.0,
+        )
+    } else {
+        original_accepted
+    };
+    let target = accepted.0 + accepted.1.saturating_sub(accepted.0) / 2;
+
+    // Selecting S should prefer unused cars. When searching its complement Q,
+    // that means preferring previously selected cars for exclusion first.
+    let preferred_pool = if complement {
+        request.previously_selected.iter().copied().collect()
+    } else {
+        request.unused.to_vec()
+    };
+    let has_fallback = if complement {
+        !request.unused.is_empty()
+    } else {
+        !request.previously_selected.is_empty()
+    };
+    let mut pools = vec![preferred_pool];
+    if has_fallback {
         pools.push((0..cars.len()).collect());
     }
     let reverse = rng.random_bool(0.5);
-    let has_reuse_fallback = pools.len() > 1;
-    let mut global_pool = (0..cars.len()).collect::<Vec<_>>();
-    global_pool.sort_unstable_by_key(|&index| (cars[index].lap_time, index));
-    let global_minimum = global_pool
-        .iter()
-        .take(request.lap_count)
-        .map(|&index| u64::from(cars[index].lap_time))
-        .sum::<u64>();
-    let global_maximum = global_pool
-        .iter()
-        .rev()
-        .take(request.lap_count)
-        .map(|&index| u64::from(cars[index].lap_time))
-        .sum::<u64>();
-    let global_span = global_maximum.saturating_sub(global_minimum);
-    let target = u64::from(request.target);
-    let target_is_central = target >= global_minimum + global_span * 45 / 100
-        && target <= global_minimum + global_span * 55 / 100;
-    for (phase, pool) in pools.iter_mut().enumerate() {
+
+    for pool in &mut pools {
         pool.sort_unstable_by_key(|&index| (cars[index].lap_time, index));
         pool.dedup();
-        if pool.len() < request.lap_count {
+        if pool.len() < search_count {
             continue;
         }
-        let preserve_unused_quality = target_is_central
-            && request.previously_selected.len() < request.lap_count.saturating_mul(16);
-        let attempt_limit = if has_reuse_fallback && phase == 0 && !preserve_unused_quality {
-            BOUNDED_UNUSED_PHASE_ATTEMPTS
-        } else {
-            BOUNDED_RANDOM_ATTEMPTS
-        };
+        let attempt_limit = BOUNDED_RANDOM_ATTEMPTS;
         let mut result = randomized_bounded_search(
             cars,
             RandomizedSearchRequest {
                 pool,
-                lap_count: request.lap_count,
+                lap_count: search_count,
                 target,
                 accepted,
                 attempt_limit,
-                prefer_directed: true,
+                usage_counts: request.usage_counts,
+                complement,
             },
             rng,
             &mut deadline_exceeded,
@@ -827,21 +1054,47 @@ fn bounded_find_approximate_subset_with_rng<R: rand::Rng, F: FnMut() -> bool>(
                 cars,
                 pool,
                 accepted,
-                target: u64::from(request.target),
+                target,
                 nodes: 0,
                 deadline_exceeded: &mut deadline_exceeded,
             };
             result = search.visit(
                 0,
-                request.lap_count,
+                search_count,
                 0,
-                &mut Vec::with_capacity(request.lap_count),
+                &mut Vec::with_capacity(search_count),
                 reverse,
             );
         }
         if let Some(mut result) = result {
+            if let Some(usage_counts) = request.usage_counts {
+                diversify_valid_selection(
+                    cars,
+                    DiversificationRequest {
+                        pool,
+                        selected: &mut result,
+                        accepted,
+                        usage_counts,
+                        prefer_selected_usage: complement,
+                    },
+                    rng,
+                    &mut deadline_exceeded,
+                );
+            }
+            if complement {
+                let excluded = result.into_iter().collect::<HashSet<_>>();
+                result = (0..cars.len())
+                    .filter(|index| !excluded.contains(index))
+                    .collect();
+            }
             result.shuffle(rng);
-            validate_bounded_subset(cars, &result, request.lap_count, request.target, accepted)?;
+            validate_bounded_subset(
+                cars,
+                &result,
+                request.lap_count,
+                request.target,
+                original_accepted,
+            )?;
             return Ok(result);
         }
         if deadline_exceeded() {
@@ -1398,21 +1651,53 @@ pub fn format_ms_to_minsecms(ms: u32) -> String {
 }
 
 pub fn compute_jaccard_similarity(results: &[Vec<CarIndex>]) -> Result<f64, String> {
-    use std::collections::HashSet;
+    if results.len() < 2 {
+        info!("Only one or no valid subsets found, skipping similarity measurement");
+        return Err(
+            "Only one or no valid subsets found, skipping similarity measurement".to_string(),
+        );
+    }
+    if results[1..].iter().all(|subset| subset == &results[0]) {
+        return Ok(1.0);
+    }
 
-    // Convert each result to a HashSet for easy intersection/union
-    let sets: Vec<HashSet<CarIndex>> = results
-        .iter()
-        .map(|subset| subset.iter().cloned().collect())
-        .collect();
+    // Compress the arbitrary index values before making dense bitsets. This avoids sizing an
+    // allocation from the largest index (which may be usize::MAX) while retaining exact set
+    // semantics for duplicates.
+    let mut indices: Vec<CarIndex> = results.iter().flatten().copied().collect();
+    indices.sort_unstable();
+    indices.dedup();
+    let words_per_set = indices.len().div_ceil(u64::BITS as usize);
+    let mut bits = vec![0_u64; results.len() * words_per_set];
+    let mut cardinalities = vec![0_usize; results.len()];
+
+    for (set_index, subset) in results.iter().enumerate() {
+        let set = &mut bits[set_index * words_per_set..(set_index + 1) * words_per_set];
+        for index in subset {
+            let compressed = indices
+                .binary_search(index)
+                .expect("index came from the input");
+            let word = &mut set[compressed / u64::BITS as usize];
+            let mask = 1_u64 << (compressed % u64::BITS as usize);
+            if *word & mask == 0 {
+                *word |= mask;
+                cardinalities[set_index] += 1;
+            }
+        }
+    }
 
     let mut total_similarity = 0.0;
     let mut count = 0;
-
-    for i in 0..sets.len() {
-        for j in (i + 1)..sets.len() {
-            let intersection_size = sets[i].intersection(&sets[j]).count();
-            let union_size = sets[i].union(&sets[j]).count();
+    for i in 0..results.len() {
+        let left = &bits[i * words_per_set..(i + 1) * words_per_set];
+        for j in (i + 1)..results.len() {
+            let right = &bits[j * words_per_set..(j + 1) * words_per_set];
+            let intersection_size: usize = left
+                .iter()
+                .zip(right)
+                .map(|(left, right)| (left & right).count_ones() as usize)
+                .sum();
+            let union_size = cardinalities[i] + cardinalities[j] - intersection_size;
             let jaccard = if union_size == 0 {
                 1.0
             } else {
@@ -1544,6 +1829,9 @@ pub fn perform_multiple_runs_with_strategy(
     let mut available_indexes: Vec<CarIndex> = (0..global_cars.len()).collect();
     let mut all_results: Vec<Vec<CarIndex>> = Vec::with_capacity(player_count);
     let mut previously_selected = HashSet::new();
+    let mut usage_counts = vec![0_usize; global_cars.len()];
+    let bounded_indexes = (0..global_cars.len()).collect::<Vec<_>>();
+    let bounded_previous = HashSet::new();
 
     for run in 1..=player_count {
         info!("\n=== Run {}/{} ===", run, player_count);
@@ -1592,8 +1880,9 @@ pub fn perform_multiple_runs_with_strategy(
                         target,
                         lap_count,
                         tolerance_percent,
-                        unused: &available_indexes,
-                        previously_selected: &previously_selected,
+                        unused: &bounded_indexes,
+                        previously_selected: &bounded_previous,
+                        usage_counts: Some(&usage_counts),
                     },
                     &mut rng,
                     || is_timeout_exceeded(start_time, max_runtime_ms),
@@ -1632,6 +1921,7 @@ pub fn perform_multiple_runs_with_strategy(
         // Update our previously selected numbers set
         for &idx in &result {
             previously_selected.insert(idx);
+            usage_counts[idx] += 1;
         }
 
         // Remove selected numbers from the pool
@@ -1892,11 +2182,72 @@ mod tests {
         );
     }
 
+    fn reference_jaccard_similarity(results: &[Vec<CarIndex>]) -> Result<f64, String> {
+        if results.len() < 2 {
+            return Err("too few subsets".to_string());
+        }
+        let sets: Vec<HashSet<_>> = results
+            .iter()
+            .map(|subset| subset.iter().copied().collect())
+            .collect();
+        let mut total = 0.0;
+        let mut pairs = 0;
+        for i in 0..sets.len() {
+            for j in (i + 1)..sets.len() {
+                let intersection = sets[i].intersection(&sets[j]).count();
+                let union = sets[i].len() + sets[j].len() - intersection;
+                total += if union == 0 {
+                    1.0
+                } else {
+                    intersection as f64 / union as f64
+                };
+                pairs += 1;
+            }
+        }
+        Ok(total / pairs as f64)
+    }
+
     #[test]
-    fn jaccard_handles_empty_pairs_and_rejects_fewer_than_two_subsets() {
+    fn jaccard_handles_empty_duplicates_arbitrary_indices_and_unequal_sets() {
         assert_eq!(compute_jaccard_similarity(&[vec![], vec![]]).unwrap(), 1.0);
+        let cases = [
+            vec![vec![1, 1, 2], vec![1, 2]],
+            vec![vec![usize::MAX, 0, usize::MAX], vec![0], vec![3, 4, 5]],
+            vec![vec![], vec![7, 7], vec![7, 8, 9]],
+        ];
+        for results in cases {
+            assert_eq!(
+                compute_jaccard_similarity(&results).unwrap(),
+                reference_jaccard_similarity(&results).unwrap()
+            );
+        }
         assert!(compute_jaccard_similarity(&[]).is_err());
         assert!(compute_jaccard_similarity(&[vec![1]]).is_err());
+    }
+
+    #[test]
+    fn jaccard_matches_reference_for_deterministic_random_inputs() {
+        let mut rng = StdRng::seed_from_u64(0x4a_4143_4341_5244);
+        for _ in 0..500 {
+            let set_count = rng.random_range(2..20);
+            let results: Vec<Vec<CarIndex>> = (0..set_count)
+                .map(|_| {
+                    let len = rng.random_range(0..80);
+                    (0..len)
+                        .map(|_| match rng.random_range(0..20) {
+                            0 => usize::MAX,
+                            1 => usize::MAX - 1,
+                            _ => rng.random_range(0..200),
+                        })
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                compute_jaccard_similarity(&results).unwrap(),
+                reference_jaccard_similarity(&results).unwrap(),
+                "results={results:?}"
+            );
+        }
     }
 
     #[test]
@@ -2639,6 +2990,230 @@ mod tests {
         legacy.report("legacy extended");
         assert_eq!((bounded.valid, bounded.invalid), (128, 0));
         assert!(bounded.valid >= legacy.valid);
+    }
+
+    #[test]
+    fn bounded_complement_matches_dual_oracle() {
+        let cars = vec![
+            car("a", 3),
+            car("b", 7),
+            car("c", 11),
+            car("d", 19),
+            car("e", 23),
+        ];
+        let total = calculate_subset_sum_u64(&cars, &[0, 1, 2, 3, 4]);
+        let target = 56;
+        let oracle = brute_force_valid_subsets(&cars, 4, target, 0.0);
+        assert!(!oracle.is_empty());
+
+        let mut rng = StdRng::seed_from_u64(7);
+        let subset = find_approximate_subset_with_strategy_and_rng(
+            SolverStrategy::Bounded,
+            &cars,
+            target,
+            4,
+            &HashSet::new(),
+            0.0,
+            &mut rng,
+        )
+        .unwrap();
+        let selected = subset.iter().copied().collect::<HashSet<_>>();
+        let excluded = (0..cars.len())
+            .filter(|index| !selected.contains(index))
+            .collect::<Vec<_>>();
+        assert_eq!(calculate_subset_sum_u64(&cars, &subset), u64::from(target));
+        assert_eq!(
+            calculate_subset_sum_u64(&cars, &excluded),
+            total - u64::from(target)
+        );
+    }
+
+    fn run_increment_one_benchmark(lap_count: usize, player_count: usize, target: u32) {
+        use std::io::Write;
+        let cars = read_cars_from_csv_string(include_str!("cars.csv")).unwrap();
+        print!("benchmark {lap_count}x{player_count} target={target}: starting... ");
+        std::io::stdout().flush().unwrap();
+        let started = Instant::now();
+        let result = perform_multiple_runs_with_strategy(
+            SolverStrategy::Bounded,
+            &cars,
+            target,
+            lap_count,
+            player_count,
+            5_000.0,
+            defaults::TOLERANCE_PERCENT,
+        );
+        let elapsed = started.elapsed();
+        let completed = result.as_ref().map_or(0, Vec::len);
+        let valid = result.as_ref().is_ok_and(|sets| {
+            sets.iter().all(|set| {
+                validate_bounded_subset(
+                    &cars,
+                    set,
+                    lap_count,
+                    target,
+                    accepted_sum_interval(target, defaults::TOLERANCE_PERCENT),
+                )
+                .is_ok()
+            })
+        });
+        let (jaccard, reuse, usage_min, usage_max) =
+            result.as_ref().map_or((f64::NAN, 0, 0, 0), |sets| {
+                let mut usage = vec![0_usize; cars.len()];
+                for &index in sets.iter().flatten() {
+                    usage[index] += 1;
+                }
+                let distinct = usage.iter().filter(|&&count| count > 0).count();
+                (
+                    compute_jaccard_similarity(sets).unwrap_or(f64::NAN),
+                    sets.iter().map(Vec::len).sum::<usize>() - distinct,
+                    usage.iter().copied().min().unwrap_or(0),
+                    usage.iter().copied().max().unwrap_or(0),
+                )
+            });
+        println!("completion={completed}/{player_count}, elapsed={elapsed:?}, valid={valid}, jaccard={jaccard:.6}, reuse={reuse}, usage_min={usage_min}, usage_max={usage_max}");
+        assert!(
+            elapsed.as_secs_f64() <= 5.5,
+            "internal five-second deadline was exceeded"
+        );
+    }
+
+    #[test]
+    #[ignore = "increment-one small benchmark"]
+    fn increment_one_benchmark_small() {
+        run_increment_one_benchmark(25, 32, 2_800_000);
+    }
+
+    #[test]
+    #[ignore = "increment-one big benchmark"]
+    fn increment_one_benchmark_big() {
+        run_increment_one_benchmark(416, 181, 27_547_641);
+    }
+
+    #[test]
+    #[ignore = "bounded 416x181 inclusive chart-range diagnostic"]
+    fn bounded_big_chart_range_diagnostic() {
+        use std::io::Write;
+        use std::time::Duration;
+
+        const TARGET_SAMPLES: usize = 10;
+        const LAP_COUNT: usize = 416;
+        const PLAYER_COUNT: usize = 181;
+        const TOLERANCE: f64 = 0.5;
+        const TIMEOUT_MS: f64 = 2_000.0;
+
+        fn percentile_duration(values: &mut [Duration], percentile: usize) -> Duration {
+            values.sort_unstable();
+            values[(values.len() - 1) * percentile / 100]
+        }
+
+        fn percentile_f64(values: &mut [f64], percentile: usize) -> f64 {
+            values.sort_by(f64::total_cmp);
+            values[(values.len() - 1) * percentile / 100]
+        }
+
+        let cars = read_cars_from_csv_string(include_str!("cars.csv")).unwrap();
+        let (minimum_target, maximum_target) = get_target_range_for_subset(&cars, LAP_COUNT);
+        let targets = (0..TARGET_SAMPLES)
+            .map(|sample| {
+                (u64::from(minimum_target)
+                    + (u64::from(maximum_target) - u64::from(minimum_target)) * sample as u64
+                        / (TARGET_SAMPLES - 1) as u64) as u32
+            })
+            .collect::<Vec<_>>();
+        let mut successful_elapsed = Vec::new();
+        let mut successful_jaccard = Vec::new();
+        let mut successful_reuse = Vec::new();
+
+        println!(
+            "bounded 416x181 chart range: targets={TARGET_SAMPLES}, range={minimum_target}..={maximum_target}, tolerance={TOLERANCE}%, internal_timeout_ms={TIMEOUT_MS}"
+        );
+        std::io::stdout().flush().unwrap();
+
+        for (sample, target) in targets.into_iter().enumerate() {
+            print!(
+                "target {}/{TARGET_SAMPLES}: target={target}... ",
+                sample + 1
+            );
+            std::io::stdout().flush().unwrap();
+            let started = Instant::now();
+            let result = perform_multiple_runs_with_strategy(
+                SolverStrategy::Bounded,
+                &cars,
+                target,
+                LAP_COUNT,
+                PLAYER_COUNT,
+                TIMEOUT_MS,
+                TOLERANCE,
+            );
+            let elapsed = started.elapsed();
+            let completed = result.as_ref().map_or_else(|_| 0, |subsets| subsets.len());
+            let valid = result.as_ref().is_ok_and(|subsets| {
+                subsets.len() == PLAYER_COUNT
+                    && subsets.iter().all(|subset| {
+                        validate_bounded_subset(
+                            &cars,
+                            subset,
+                            LAP_COUNT,
+                            target,
+                            accepted_sum_interval(target, TOLERANCE),
+                        )
+                        .is_ok()
+                    })
+            });
+            let (jaccard, reused, distinct, usage_min, usage_max, usage_stddev) = result
+                .as_ref()
+                .map_or((f64::NAN, 0, 0, 0, 0, f64::NAN), |subsets| {
+                    let mut usage = vec![0_usize; cars.len()];
+                    for &index in subsets.iter().flatten() {
+                        usage[index] += 1;
+                    }
+                    let total = subsets.iter().map(Vec::len).sum::<usize>();
+                    let distinct = usage.iter().filter(|&&count| count > 0).count();
+                    let mean = total as f64 / usage.len() as f64;
+                    let variance = usage
+                        .iter()
+                        .map(|&count| {
+                            let difference = count as f64 - mean;
+                            difference * difference
+                        })
+                        .sum::<f64>()
+                        / usage.len() as f64;
+                    (
+                        compute_jaccard_similarity(subsets).unwrap_or(f64::NAN),
+                        total - distinct,
+                        distinct,
+                        usage.iter().copied().min().unwrap_or(0),
+                        usage.iter().copied().max().unwrap_or(0),
+                        variance.sqrt(),
+                    )
+                });
+            println!(
+                "completion={completed}/{PLAYER_COUNT}, elapsed={elapsed:?}, valid={valid}, jaccard={jaccard:.6}, reused={reused}, distinct={distinct}, usage_min={usage_min}, usage_max={usage_max}, usage_stddev={usage_stddev:.6}"
+            );
+            std::io::stdout().flush().unwrap();
+            if valid {
+                successful_elapsed.push(elapsed);
+                successful_jaccard.push(jaccard);
+                successful_reuse.push(reused as f64);
+            }
+        }
+
+        if successful_elapsed.is_empty() {
+            println!("summary: successes=0/{TARGET_SAMPLES}");
+        } else {
+            let elapsed_p50 = percentile_duration(&mut successful_elapsed.clone(), 50);
+            let elapsed_p95 = percentile_duration(&mut successful_elapsed.clone(), 95);
+            let jaccard_p50 = percentile_f64(&mut successful_jaccard.clone(), 50);
+            let jaccard_p95 = percentile_f64(&mut successful_jaccard.clone(), 95);
+            let reuse_p50 = percentile_f64(&mut successful_reuse.clone(), 50);
+            let reuse_p95 = percentile_f64(&mut successful_reuse.clone(), 95);
+            println!(
+                "summary: successes={}/{TARGET_SAMPLES}, elapsed_p50={elapsed_p50:?}, elapsed_p95={elapsed_p95:?}, jaccard_p50={jaccard_p50:.6}, jaccard_p95={jaccard_p95:.6}, reused_p50={reuse_p50:.0}, reused_p95={reuse_p95:.0}",
+                successful_elapsed.len(),
+            );
+        }
+        std::io::stdout().flush().unwrap();
     }
 
     #[test]
